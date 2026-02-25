@@ -870,10 +870,72 @@ with tab5:
 # ══════════════════════════════════════════════
 with tab6:
     st.subheader("Proprietary Win Prediction Model")
+
+    with st.expander("📖 How this model works", expanded=False):
+        st.markdown("""
+**Overview**
+
+A proprietary multi-signal ensemble that blends four independent data sources into a
+single win probability. Differs from DataGolf by incorporating live DraftKings market
+prices and a custom recency-weighted course history score.
+
+---
+
+**Signals & Base Weights**
+
+| Signal | Weight | Source | What it captures |
+|--------|--------|--------|-----------------|
+| **DataGolf (Skill + History)** | 45% | DataGolf pre-tournament model | Player skill ratings + course history fit |
+| **DraftKings Market** | 30% | DraftKings outright win odds, vig-removed | Market consensus / public money |
+| **Kalshi** | 15% | Kalshi prediction markets (liquid only) | Crowd wisdom from prediction traders |
+| **Course History Score** | 10% | Our recency-weighted custom score | Performance at this specific course |
+
+---
+
+**DraftKings Vig Removal**
+
+Raw DraftKings implied probs sum to >100% (the sportsbook's overround/vig).
+We normalize the full field so probs sum to 1.0:
+`vig_free = dk_implied / sum(all players' dk_implied)`
+
+---
+
+**Course History Scoring**
+
+Each finish is scored and multiplied by a recency year weight:
+
+| Finish | Score | Year | Weight |
+|--------|-------|------|--------|
+| Win | 100 | 2025 | 5× |
+| T2–T5 | 65 | 2024 | 4× |
+| T6–T10 | 35 | 2023 | 3× |
+| T11–T20 | 15 | 2022 | 2× |
+| T21–T30 | 5 | 2021 | 1× |
+| CUT/WD/DQ | 0 | — | — |
+
+Scores are normalized 0–1 against the best course performer in this week's field.
+Players with no course history receive no course history signal.
+
+---
+
+**Adaptive Weights**
+
+When a signal is unavailable (thin Kalshi market, no DraftKings price, no course history),
+its weight is set to 0 and the remaining weights scale up proportionally to always sum to 100%.
+
+---
+
+**Rank Delta (Δ vs DG)**
+
+`Δ = DataGolf rank − Proprietary rank`
+- **Green / positive** = our model ranks the player *higher* (more bullish than DG)
+- **Red / negative** = our model ranks the player *lower* (more bearish than DG)
+        """)
+
     st.caption(
-        "Multi-signal ensemble: **DataGolf (45%)** + **Sportsbook Market (30%)** + "
-        "**Kalshi (15%)** + **Course History (10%)**. "
-        "Weights are adaptive when signals are unavailable for a player."
+        "Signals: **DataGolf (45%)** + **DraftKings odds (30%)** + "
+        "**Kalshi (15%)** + **Course History Score (10%)**. "
+        "Weights adapt when a signal is unavailable."
     )
 
     if not event_id:

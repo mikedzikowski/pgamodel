@@ -40,8 +40,9 @@ BASE_WEIGHTS: dict[str, float] = {
     "history": 0.10,
 }
 
-# Non-book fields in sportsbook odds response
-_NON_BOOK_FIELDS = {"player_name", "dg_id", "consensus_prob"}
+# Fields in the outright odds response that are NOT sportsbook implied probs
+# "datagolf" is a nested dict (baseline/history model), not a book
+_NON_BOOK_FIELDS = {"player_name", "dg_id", "consensus_prob", "datagolf"}
 
 
 # ──────────────────────────────────────────────
@@ -199,49 +200,53 @@ class ProprietaryModel:
         """
         Extract vig-free implied win probabilities from sportsbook data.
 
-        Algorithm:
-          1. For each player, average implied_prob across all books that reported a price.
-          2. Sum all per-player averages (> 1.0 due to vig/overround).
-          3. Divide each player's average by the total to remove vig.
+        Strategy:
+          1. Use DraftKings as the primary market signal (most liquid US book).
+          2. If DraftKings is missing for a player, fall back to the average
+             across all available books for that player.
+          3. Normalize the full field to remove vig (overround), so probs sum to 1.0.
+
+        The DataGolf API returns book odds as plain floats (implied probabilities
+        with vig, e.g. 0.0526). The "datagolf" key is a nested dict and is excluded.
 
         Returns:
-            {player_name: vig_free_prob}  (sportsbook name format, e.g. "Ryan Gerard")
+            {player_name: vig_free_prob}  names in DataGolf "Last, First" format
         """
         odds_list = odds_data.get("odds", [])
         if not odds_list:
             return {}
 
-        raw_averages: dict[str, float] = {}
+        raw_probs: dict[str, float] = {}
 
         for entry in odds_list:
             player_name = entry.get("player_name", "")
             if not player_name:
                 continue
 
-            book_probs: list[float] = []
-            for key, val in entry.items():
-                if key in _NON_BOOK_FIELDS or not isinstance(val, dict):
-                    continue
-                implied = val.get("implied_prob")
-                if implied is not None and isinstance(implied, (int, float)) and float(implied) > 0:
-                    book_probs.append(float(implied))
+            # Prefer DraftKings; fall back to average across all books
+            dk = entry.get("draftkings")
+            if dk is not None and isinstance(dk, (int, float)) and float(dk) > 0:
+                raw_probs[player_name] = float(dk)
+            else:
+                book_probs = [
+                    float(v)
+                    for k, v in entry.items()
+                    if k not in _NON_BOOK_FIELDS
+                    and isinstance(v, (int, float))
+                    and float(v) > 0
+                ]
+                if book_probs:
+                    raw_probs[player_name] = sum(book_probs) / len(book_probs)
 
-            if book_probs:
-                raw_averages[player_name] = sum(book_probs) / len(book_probs)
-            elif entry.get("consensus_prob"):
-                # Fallback: use DataGolf's pre-computed consensus if we couldn't extract book probs
-                cp = entry["consensus_prob"]
-                if cp and float(cp) > 0:
-                    raw_averages[player_name] = float(cp)
-
-        if not raw_averages:
+        if not raw_probs:
             return {}
 
-        total = sum(raw_averages.values())
+        # Vig removal: normalize so the full field sums to 1.0
+        total = sum(raw_probs.values())
         if total <= 0:
             return {}
 
-        return {name: prob / total for name, prob in raw_averages.items()}
+        return {name: prob / total for name, prob in raw_probs.items()}
 
     def _compute_course_scores(
         self,
