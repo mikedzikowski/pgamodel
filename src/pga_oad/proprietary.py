@@ -2,10 +2,11 @@
 Proprietary PGA Win Prediction Model
 
 Multi-signal ensemble that differs from DataGolf by combining:
-  1. DataGolf skill + course history model (45% base weight)
-  2. Sportsbook market consensus — vig-removed average across all books (30%)
+  1. DataGolf skill + course history model (40% base weight)
+  2. Sportsbook market consensus — vig-removed DraftKings (30%)
   3. Kalshi prediction markets — liquid markets only (15%)
-  4. Recency-weighted course history score — our own scoring (10%)
+  4. Recent form score — recency-weighted last 5 events (10%)
+  5. Recency-weighted course history score — our own scoring (5%)
 
 Weights are adaptive: when a signal is unavailable for a player the weight
 is redistributed proportionally to the remaining signals.
@@ -32,12 +33,17 @@ YEAR_WEIGHTS: dict[int, int] = {
     2021: 1,
 }
 
+# Recent form: last N completed events, recency rank 0 = most recent
+RECENT_FORM_EVENTS = 5
+FORM_EVENT_WEIGHTS: dict[int, int] = {0: 5, 1: 4, 2: 3, 3: 2, 4: 1}
+
 # Base signal weights (must sum to 1.0)
 BASE_WEIGHTS: dict[str, float] = {
-    "dg":      0.45,
+    "dg":      0.40,
     "market":  0.30,
     "kalshi":  0.15,
-    "history": 0.10,
+    "form":    0.10,
+    "history": 0.05,
 }
 
 # Fields in the outright odds response that are NOT sportsbook implied probs
@@ -63,7 +69,8 @@ class ProprietaryPlayer:
     market_consensus_prob: Optional[float]    # Vig-free sportsbook consensus
     dk_raw_prob: Optional[float]              # Raw DraftKings implied prob (with vig, for display)
     kalshi_win_prob: Optional[float]          # Kalshi implied probability
-    recency_course_score: Optional[float]     # 0.0–1.0 recency-weighted history
+    recent_form_score: Optional[float]        # 0.0–1.0 recency-weighted recent form (last 5 events)
+    recency_course_score: Optional[float]     # 0.0–1.0 recency-weighted course history
 
     # Output
     proprietary_win_prob: float = 0.0
@@ -112,6 +119,8 @@ class ProprietaryModel:
         odds_data = self.client.get_outright_odds(tour="pga", market="win", odds_format="percent")
         kalshi_probs = self._fetch_kalshi(event_code)
         history_map = self._fetch_course_history(event_id)
+        recent_event_ids = self._fetch_recent_form_event_ids(event_id)
+        recent_form_data = self._fetch_recent_form_data(recent_event_ids)
 
         # ── Parse DataGolf ─────────────────────────────────────────────────
         baseline_map: dict[int, dict] = {p["dg_id"]: p for p in dg_data.get("baseline", [])}
@@ -122,6 +131,8 @@ class ProprietaryModel:
         dk_raw_probs = self._extract_dk_raw(odds_data)
         raw_course_scores, finish_history_map = self._compute_course_scores(history_map)
         course_score_map = self._normalize_course_scores(raw_course_scores)
+        raw_form_scores = self._compute_recent_form_scores(recent_form_data)
+        form_score_map = self._normalize_course_scores(raw_form_scores)  # same 0-1 normalization
 
         # ── Build per-player output ────────────────────────────────────────
         players: list[ProprietaryPlayer] = []
@@ -137,12 +148,14 @@ class ProprietaryModel:
             # Kalshi uses "First Last" format — needs name conversion
             kalshi_prob = self._match_player_name(player_name, kalshi_probs)
             course_score = course_score_map.get(dg_id)
+            form_score = form_score_map.get(dg_id)
             finish_hist = finish_history_map.get(dg_id, {})
 
             weights = self._compute_weights(
                 kalshi_ok=kalshi_prob is not None,
                 market_ok=market_prob is not None,
                 history_ok=course_score is not None,
+                form_ok=form_score is not None,
             )
 
             prop_prob = self._blend(
@@ -150,6 +163,7 @@ class ProprietaryModel:
                 market=market_prob,
                 kalshi=kalshi_prob,
                 course=course_score,
+                form=form_score,
                 weights=weights,
             )
 
@@ -161,6 +175,7 @@ class ProprietaryModel:
                 market_consensus_prob=market_prob,
                 dk_raw_prob=dk_raw,
                 kalshi_win_prob=kalshi_prob,
+                recent_form_score=form_score,
                 recency_course_score=course_score,
                 proprietary_win_prob=prop_prob,
                 weights_used=weights,
@@ -199,6 +214,94 @@ class ProprietaryModel:
             except Exception:
                 result[year] = {}
         return result
+
+    def _fetch_recent_form_event_ids(self, current_event_id: int) -> list[int]:
+        """
+        Return the last RECENT_FORM_EVENTS completed PGA Tour event IDs,
+        most recent first, excluding the current event.
+        """
+        try:
+            schedule_data = self.client.get_schedule(tour="pga", upcoming_only=False)
+            events = schedule_data.get("schedule", [])
+        except Exception:
+            return []
+
+        completed = [
+            e for e in events
+            if e.get("status") == "completed"
+            and str(e.get("event_id", "")) != str(current_event_id)
+        ]
+        # Sort descending by start_date so index 0 = most recent
+        completed.sort(key=lambda e: e.get("start_date", ""), reverse=True)
+        return [int(e["event_id"]) for e in completed[:RECENT_FORM_EVENTS]]
+
+    def _fetch_recent_form_data(
+        self, recent_event_ids: list[int]
+    ) -> dict[int, dict[int, dict]]:
+        """
+        Fetch archive data for each recent event.
+
+        Tries year=2025 first (current PGA season), then 2026 and 2024 as fallbacks,
+        to handle the PGA Tour's fiscal-year naming convention.
+
+        Returns:
+            {recency_rank: {dg_id: player_archive_dict}}   (rank 0 = most recent)
+        """
+        result: dict[int, dict[int, dict]] = {}
+        for rank, event_id in enumerate(recent_event_ids):
+            for year in [2025, 2026, 2024]:
+                try:
+                    arch = self.client.get_pre_tournament_archive(
+                        event_id=event_id, year=year, odds_format="percent"
+                    )
+                    players = arch.get("baseline", [])
+                    if players:
+                        result[rank] = {p["dg_id"]: p for p in players}
+                        break
+                except Exception:
+                    continue
+            if rank not in result:
+                result[rank] = {}
+        return result
+
+    def _compute_recent_form_scores(
+        self, form_data: dict[int, dict[int, dict]]
+    ) -> dict[int, float]:
+        """
+        Compute recency-weighted recent form scores across the last N events.
+
+        For each player, score each event finish and weight by FORM_EVENT_WEIGHTS
+        (rank 0 = most recent = highest weight). Normalize per participation
+        so a player who only played 1 of 5 events is not penalized for absence.
+
+        Returns:
+            {dg_id: raw_score 0.0–1.0}  — player absent from all events → not in dict
+        """
+        all_player_ids: set[int] = set()
+        for rank_data in form_data.values():
+            all_player_ids.update(rank_data.keys())
+
+        raw_scores: dict[int, float] = {}
+        for dg_id in all_player_ids:
+            weighted_sum = 0.0
+            max_possible = 0.0
+
+            for recency_rank, rank_data in form_data.items():
+                player_entry = rank_data.get(dg_id)
+                if player_entry is None:
+                    continue
+                fin_text = player_entry.get("fin_text", "")
+                if not fin_text or fin_text in ("-", "---", "—"):
+                    continue
+
+                weight = FORM_EVENT_WEIGHTS.get(recency_rank, 1)
+                weighted_sum += self._position_score(fin_text) * weight
+                max_possible += 100.0 * weight
+
+            if max_possible > 0:
+                raw_scores[dg_id] = weighted_sum / max_possible
+
+        return raw_scores
 
     # ── Private: signal computation ─────────────────────────────────────────
 
@@ -371,11 +474,12 @@ class ProprietaryModel:
         kalshi_ok: bool,
         market_ok: bool,
         history_ok: bool,
+        form_ok: bool = False,
     ) -> dict[str, float]:
         """
         Compute adaptive signal weights based on data availability.
 
-        Base: dg=45%, market=30%, kalshi=15%, history=10%
+        Base: dg=40%, market=30%, kalshi=15%, form=10%, history=5%
 
         Unavailable signals are zeroed out and the remaining weights are
         re-normalized proportionally so they always sum to 1.0.  This ensures
@@ -389,11 +493,13 @@ class ProprietaryModel:
             w["market"] = 0.0
         if not history_ok:
             w["history"] = 0.0
+        if not form_ok:
+            w["form"] = 0.0
 
         total = sum(w.values())
         if total > 0:
             return {k: v / total for k, v in w.items()}
-        return {"dg": 1.0, "market": 0.0, "kalshi": 0.0, "history": 0.0}
+        return {"dg": 1.0, "market": 0.0, "kalshi": 0.0, "history": 0.0, "form": 0.0}
 
     @staticmethod
     def _blend(
@@ -401,6 +507,7 @@ class ProprietaryModel:
         market: Optional[float],
         kalshi: Optional[float],
         course: Optional[float],
+        form: Optional[float],
         weights: dict[str, float],
     ) -> float:
         """Weighted blend of available signals."""
@@ -409,6 +516,8 @@ class ProprietaryModel:
             result += weights["market"] * market
         if kalshi is not None and weights["kalshi"] > 0:
             result += weights["kalshi"] * kalshi
+        if form is not None and weights.get("form", 0) > 0:
+            result += weights["form"] * form
         if course is not None and weights["history"] > 0:
             result += weights["history"] * course
         return result

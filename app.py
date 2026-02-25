@@ -278,6 +278,14 @@ def build_prop_tooltip(p) -> str:
     elif kal_wt == 0:
         lines.append(f"{'Kalshi':14s}  (  0%):  n/a")
 
+    frm = getattr(p, "recent_form_score", None)
+    frm_wt = w.get("form", 0) * 100
+    if frm is not None and frm_wt > 0:
+        frm_cont = frm * w["form"] * 100
+        lines.append(f"{'Form Score':14s} ({frm_wt:4.0f}%):  {frm:5.2f}   →  {frm_cont:5.2f}%")
+    elif frm_wt == 0:
+        lines.append(f"{'Form Score':14s}  (  0%):  n/a")
+
     crs = p.recency_course_score
     crs_wt = w.get("history", 0) * 100
     if crs is not None and crs_wt > 0:
@@ -942,9 +950,9 @@ with tab6:
         st.markdown("""
 **Overview**
 
-A proprietary multi-signal ensemble that blends four independent data sources into a
+A proprietary multi-signal ensemble that blends five independent data sources into a
 single win probability. Differs from DataGolf by incorporating live DraftKings market
-prices and a custom recency-weighted course history score.
+prices, recent tournament form, and a custom recency-weighted course history score.
 
 ---
 
@@ -952,10 +960,11 @@ prices and a custom recency-weighted course history score.
 
 | Signal | Weight | Source | What it captures |
 |--------|--------|--------|-----------------|
-| **DataGolf (Skill + History)** | 45% | DataGolf pre-tournament model | Player skill ratings + course history fit |
+| **DataGolf (Skill + History)** | 40% | DataGolf pre-tournament model | Player skill ratings + course history fit |
 | **DraftKings Market** | 30% | DraftKings outright win odds, vig-removed | Market consensus / public money |
 | **Kalshi** | 15% | Kalshi prediction markets (liquid only) | Crowd wisdom from prediction traders |
-| **Course History Score** | 10% | Our recency-weighted custom score | Performance at this specific course |
+| **Recent Form** | 10% | Last 5 completed PGA Tour events | Hot/cold streaks going into this week |
+| **Course History Score** | 5% | Our recency-weighted custom score | Performance at this specific course |
 
 ---
 
@@ -967,28 +976,47 @@ We normalize the full field so probs sum to 1.0:
 
 ---
 
-**Course History Scoring**
+**Recent Form Scoring**
 
-Each finish is scored and multiplied by a recency year weight:
+Finish positions from the last 5 completed PGA Tour events are scored and weighted
+by recency (most recent = highest weight):
 
-| Finish | Score | Year | Weight |
-|--------|-------|------|--------|
-| Win | 100 | 2025 | 16× |
-| T2–T5 | 65 | 2024 | 8× |
-| T6–T10 | 35 | 2023 | 4× |
-| T11–T20 | 15 | 2022 | 2× |
-| T21–T30 | 5 | 2021 | 1× |
+| Finish | Score | Event Recency | Weight |
+|--------|-------|---------------|--------|
+| Win | 100 | Most recent | 5× |
+| T2–T5 | 65 | 2nd most recent | 4× |
+| T6–T10 | 35 | 3rd most recent | 3× |
+| T11–T20 | 15 | 4th most recent | 2× |
+| T21–T30 | 5 | 5th most recent | 1× |
 | CUT/WD/DQ | 0 | — | — |
 
-Scores are normalized 0–1 against the best course performer in this week's field.
-Players with no course history receive no course history signal.
+Scores are normalized 0–1 against the hottest player in this week's field.
+Players who missed all 5 recent events receive no form signal.
+
+---
+
+**Course History Scoring**
+
+Same position scoring applied to past appearances at this specific course,
+with exponential year weighting (2× decay per year):
+
+| Year | Weight |
+|------|--------|
+| 2025 | 16× |
+| 2024 | 8× |
+| 2023 | 4× |
+| 2022 | 2× |
+| 2021 | 1× |
+
+Normalized 0–1 against the best course performer in this week's field.
 
 ---
 
 **Adaptive Weights**
 
-When a signal is unavailable (thin Kalshi market, no DraftKings price, no course history),
-its weight is set to 0 and the remaining weights scale up proportionally to always sum to 100%.
+When a signal is unavailable (thin Kalshi market, no DraftKings price, no recent events,
+no course history), its weight is set to 0 and the remaining weights scale up
+proportionally to always sum to 100%.
 
 ---
 
@@ -1000,8 +1028,8 @@ its weight is set to 0 and the remaining weights scale up proportionally to alwa
         """)
 
     st.caption(
-        "Signals: **DataGolf (45%)** + **DraftKings odds (30%)** + "
-        "**Kalshi (15%)** + **Course History Score (10%)**. "
+        "Signals: **DataGolf (40%)** + **DraftKings odds (30%)** + "
+        "**Kalshi (15%)** + **Recent Form (10%)** + **Course History (5%)**. "
         "Weights adapt when a signal is unavailable."
     )
 
@@ -1024,13 +1052,15 @@ its weight is set to 0 and the remaining weights scale up proportionally to alwa
             # ── Summary metrics ──────────────────────────────────────────
             market_cov  = sum(1 for p in prop_players if p.market_consensus_prob is not None)
             kalshi_cov  = sum(1 for p in prop_players if p.kalshi_win_prob is not None)
+            form_cov    = sum(1 for p in prop_players if getattr(p, "recent_form_score", None) is not None)
             history_cov = sum(1 for p in prop_players if p.recency_course_score is not None)
 
-            pm1, pm2, pm3, pm4 = st.columns(4)
+            pm1, pm2, pm3, pm4, pm5 = st.columns(5)
             pm1.metric("Field size", len(prop_players))
             pm2.metric("Sportsbook coverage", f"{market_cov}/{len(prop_players)}")
             pm3.metric("Kalshi coverage", f"{kalshi_cov}/{len(prop_players)}")
-            pm4.metric("Course history", f"{history_cov}/{len(prop_players)}")
+            pm4.metric("Recent form", f"{form_cov}/{len(prop_players)}")
+            pm5.metric("Course history", f"{history_cov}/{len(prop_players)}")
 
             st.divider()
 
@@ -1051,7 +1081,7 @@ its weight is set to 0 and the remaining weights scale up proportionally to alwa
                 return ""
 
             headers = ["Prop#", "Δ vs DG", "Player", "Used", "Prop Win% ⓘ",
-                       "DG Win%", "DK Odds", "Market%", "Kalshi%", "Crs Score", "Weights"]
+                       "DG Win%", "DK Odds", "Market%", "Kalshi%", "Form", "Crs Score", "Weights"]
             th = "".join(f"<th>{h}</th>" for h in headers)
 
             rows_html = []
@@ -1061,9 +1091,11 @@ its weight is set to 0 and the remaining weights scale up proportionally to alwa
                 wt_str = (f"DG{w.get('dg',0)*100:.0f}/"
                           f"Mkt{w.get('market',0)*100:.0f}/"
                           f"Kal{w.get('kalshi',0)*100:.0f}/"
+                          f"Frm{w.get('form',0)*100:.0f}/"
                           f"Hist{w.get('history',0)*100:.0f}")
                 tip = build_prop_tooltip(p).replace('"', '&quot;')
                 delta_s = _delta_style(p.rank_delta)
+                frm = getattr(p, "recent_form_score", None)
                 rows_html.append(
                     f'<tr{"  class=\"used\"" if is_used else ""}>'
                     f"<td>{p.proprietary_rank}</td>"
@@ -1075,6 +1107,7 @@ its weight is set to 0 and the remaining weights scale up proportionally to alwa
                     f"<td>{fmt_american(getattr(p, 'dk_raw_prob', None))}</td>"
                     f'<td>{"—" if p.market_consensus_prob is None else fmt_pct(p.market_consensus_prob)}</td>'
                     f'<td>{"—" if p.kalshi_win_prob is None else fmt_pct(p.kalshi_win_prob)}</td>'
+                    f'<td>{"—" if frm is None else f"{frm:.2f}"}</td>'
                     f'<td>{"—" if p.recency_course_score is None else f"{p.recency_course_score:.2f}"}</td>'
                     f'<td style="color:#888;font-size:0.75rem">{wt_str}</td>'
                     f"</tr>"
@@ -1090,6 +1123,7 @@ its weight is set to 0 and the remaining weights scale up proportionally to alwa
                 "**Prop#** = our rank  |  "
                 "**Δ vs DG** = DG rank minus our rank "
                 "(green = we rank higher / more bullish, red = we rank lower / more bearish)  |  "
+                "**Form** = 0–1 recent form score (last 5 events)  |  "
                 "**Crs Score** = 0–1 recency-weighted course history  |  "
                 "**Weights** = adaptive signal weights applied for this player"
             )
@@ -1114,6 +1148,7 @@ its weight is set to 0 and the remaining weights scale up proportionally to alwa
                         fin = p.finish_history.get(yr, "—")
                         hist_parts.append(f"{yr}: {fin}")
 
+                    _frm = getattr(p, "recent_form_score", None)
                     div_records.append({
                         "Player":    dg_name_to_display(p.player_name),
                         "DG#":       p.dg_rank,
@@ -1125,6 +1160,7 @@ its weight is set to 0 and the remaining weights scale up proportionally to alwa
                         "DK Odds":   fmt_american(getattr(p, "dk_raw_prob", None)),
                         "Market%":   fmt_pct(p.market_consensus_prob) if p.market_consensus_prob is not None else "—",
                         "Kalshi%":   fmt_pct(p.kalshi_win_prob) if p.kalshi_win_prob is not None else "—",
+                        "Form":      f"{_frm:.2f}" if _frm is not None else "—",
                         "Crs Score": f"{p.recency_course_score:.2f}" if p.recency_course_score is not None else "—",
                         "History":   "  |  ".join(hist_parts),
                     })
