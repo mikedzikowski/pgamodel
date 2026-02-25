@@ -89,6 +89,38 @@ def load_proprietary_model(event_id: int, event_code: str) -> list:
     return model.compute(event_id=event_id, event_code=event_code)
 
 
+@st.cache_data(ttl=86400, show_spinner=False)
+def load_schedule_winners(event_ids: tuple, years: tuple) -> dict:
+    """
+    Returns {event_id_str: {year: "First Last"}} for the given events and years.
+
+    Fetches archive data for each (event_id, year) and extracts the winner
+    (fin_text == "1"). Results are cached for 24 hours.
+    """
+    client = DataGolfClient(cache_dir=CACHE_DIR)
+    result: dict = {}
+    for event_id in event_ids:
+        result[str(event_id)] = {}
+        for year in years:
+            try:
+                arch = client.get_pre_tournament_archive(
+                    event_id=int(event_id), year=int(year), odds_format="percent"
+                )
+                players = arch.get("baseline", [])
+                winner = next(
+                    (p["player_name"] for p in players if p.get("fin_text") == "1"),
+                    None,
+                )
+                if winner:
+                    # Convert "Last, First" → "First Last" for display
+                    parts = winner.split(", ", 1)
+                    display = f"{parts[1]} {parts[0]}" if len(parts) == 2 else winner
+                    result[str(event_id)][year] = display
+            except Exception:
+                pass
+    return result
+
+
 # ──────────────────────────────────────────────
 # Helpers
 # ──────────────────────────────────────────────
@@ -832,12 +864,26 @@ with tab4:
         st.divider()
         st.markdown("#### Remaining Season Schedule")
         if schedule:
-            sched_df = pd.DataFrame([{
-                "Event": e.get("event_name", ""),
-                "Course": e.get("course", "")[:40],
-                "Date": e.get("date", ""),
-                "Event ID": e.get("event_id", ""),
-            } for e in schedule[:20]])
+            sched_events = schedule[:20]
+            event_id_tuple = tuple(e.get("event_id", "") for e in sched_events)
+            winner_years = (2024, 2023, 2022)
+            with st.spinner("Loading past winners..."):
+                past_winners = load_schedule_winners(event_id_tuple, winner_years)
+
+            sched_rows = []
+            for e in sched_events:
+                eid = str(e.get("event_id", ""))
+                ew = past_winners.get(eid, {})
+                sched_rows.append({
+                    "Event": e.get("event_name", ""),
+                    "Course": e.get("course", "")[:40],
+                    "Date": e.get("date", ""),
+                    "2024 Winner": ew.get(2024, "—"),
+                    "2023 Winner": ew.get(2023, "—"),
+                    "2022 Winner": ew.get(2022, "—"),
+                    "Event ID": e.get("event_id", ""),
+                })
+            sched_df = pd.DataFrame(sched_rows)
             st.dataframe(sched_df, hide_index=True, use_container_width=True)
 
 
