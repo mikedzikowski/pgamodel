@@ -79,6 +79,16 @@ def detect_kalshi_event_code() -> str | None:
     return client.detect_current_event_code()
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_proprietary_model(event_id: int, event_code: str) -> list:
+    """Compute and cache the proprietary model output."""
+    from pga_oad.proprietary import ProprietaryModel
+    client = DataGolfClient(cache_dir=CACHE_DIR)
+    kalshi_client = KalshiClient(cache_dir=CACHE_DIR)
+    model = ProprietaryModel(client=client, kalshi=kalshi_client)
+    return model.compute(event_id=event_id, event_code=event_code)
+
+
 # ──────────────────────────────────────────────
 # Helpers
 # ──────────────────────────────────────────────
@@ -398,9 +408,14 @@ st.divider()
 # ──────────────────────────────────────────────
 # Tabs
 # ──────────────────────────────────────────────
-tab1, tab2, tab3, tab4, tab5 = st.tabs(
-    ["📊 Full Field", "🏌️ Course History", "📈 DG vs Kalshi", "🎯 OAD Pick", "💰 Kalshi Markets"]
-)
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    "📊 Full Field",
+    "🏌️ Course History",
+    "📈 DG vs Kalshi",
+    "🎯 OAD Pick",
+    "💰 Kalshi Markets",
+    "🔬 Proprietary Model",
+])
 
 
 # ══════════════════════════════════════════════
@@ -848,3 +863,161 @@ with tab5:
                 "**Mid** = fair-value estimate.  "
                 "**⚠️ thin** = no active quotes (floor-price artifact, excluded from blended model)."
             )
+
+
+# ══════════════════════════════════════════════
+# TAB 6 — Proprietary Model
+# ══════════════════════════════════════════════
+with tab6:
+    st.subheader("Proprietary Win Prediction Model")
+    st.caption(
+        "Multi-signal ensemble: **DataGolf (45%)** + **Sportsbook Market (30%)** + "
+        "**Kalshi (15%)** + **Course History (10%)**. "
+        "Weights are adaptive when signals are unavailable for a player."
+    )
+
+    if not event_id:
+        st.error("Cannot determine event ID from schedule. Cannot run proprietary model.")
+    else:
+        with st.spinner("Running proprietary model..."):
+            try:
+                prop_players = load_proprietary_model(
+                    event_id=int(event_id),
+                    event_code=event_code or "",
+                )
+            except Exception as _e:
+                st.error(f"Proprietary model error: {_e}")
+                prop_players = []
+
+        if not prop_players:
+            st.warning("No proprietary model output available.")
+        else:
+            # ── Summary metrics ──────────────────────────────────────────
+            market_cov  = sum(1 for p in prop_players if p.market_consensus_prob is not None)
+            kalshi_cov  = sum(1 for p in prop_players if p.kalshi_win_prob is not None)
+            history_cov = sum(1 for p in prop_players if p.recency_course_score is not None)
+
+            pm1, pm2, pm3, pm4 = st.columns(4)
+            pm1.metric("Field size", len(prop_players))
+            pm2.metric("Sportsbook coverage", f"{market_cov}/{len(prop_players)}")
+            pm3.metric("Kalshi coverage", f"{kalshi_cov}/{len(prop_players)}")
+            pm4.metric("Course history", f"{history_cov}/{len(prop_players)}")
+
+            st.divider()
+
+            # ── Full field table ─────────────────────────────────────────
+            st.markdown("#### Full Field Rankings")
+
+            def _fmt_delta(v: int) -> str:
+                if v == 0:
+                    return "—"
+                sign = "+" if v > 0 else ""
+                return f"{sign}{v}"
+
+            prop_records = []
+            for p in prop_players:
+                is_used = p.dg_id in used_player_ids
+                w = p.weights_used
+                wt_str = (
+                    f"DG{w.get('dg', 0)*100:.0f}/"
+                    f"Mkt{w.get('market', 0)*100:.0f}/"
+                    f"Kal{w.get('kalshi', 0)*100:.0f}/"
+                    f"Hist{w.get('history', 0)*100:.0f}"
+                )
+                prop_records.append({
+                    "Prop#":     p.proprietary_rank,
+                    "Δ vs DG":   _fmt_delta(p.rank_delta),
+                    "Player":    dg_name_to_display(p.player_name),
+                    "Used":      "✓" if is_used else "",
+                    "Prop Win%": fmt_pct(p.proprietary_win_prob),
+                    "DG Win%":   fmt_pct(p.dg_win_prob_history),
+                    "Market%":   fmt_pct(p.market_consensus_prob) if p.market_consensus_prob is not None else "—",
+                    "Kalshi%":   fmt_pct(p.kalshi_win_prob) if p.kalshi_win_prob is not None else "—",
+                    "Crs Score": f"{p.recency_course_score:.2f}" if p.recency_course_score is not None else "—",
+                    "Weights":   wt_str,
+                })
+
+            prop_df = pd.DataFrame(prop_records)
+
+            def _color_delta(val: str) -> str:
+                if val == "—":
+                    return ""
+                try:
+                    num = int(str(val).replace("+", ""))
+                    if num >= 5:
+                        return "background-color: #2ecc71; color: white; font-weight: bold"
+                    if num >= 2:
+                        return "background-color: #a8e6cf; color: black"
+                    if num <= -5:
+                        return "background-color: #e74c3c; color: white; font-weight: bold"
+                    if num <= -2:
+                        return "background-color: #fab1a0; color: black"
+                except (ValueError, TypeError):
+                    pass
+                return ""
+
+            def _color_prop_row(row):
+                if row["Used"] == "✓":
+                    return ["opacity: 0.4; text-decoration: line-through"] * len(row)
+                return [""] * len(row)
+
+            styled_prop = (
+                prop_df.style
+                .apply(_color_prop_row, axis=1)
+                .applymap(_color_delta, subset=["Δ vs DG"])
+            )
+
+            st.dataframe(styled_prop, use_container_width=True, height=600, hide_index=True)
+            st.caption(
+                "**Prop#** = our rank  |  "
+                "**Δ vs DG** = DG rank minus our rank "
+                "(green = we rank higher / more bullish, red = we rank lower / more bearish)  |  "
+                "**Crs Score** = 0–1 recency-weighted course history  |  "
+                "**Weights** = adaptive signal weights applied for this player"
+            )
+
+            st.divider()
+
+            # ── Key Divergences ──────────────────────────────────────────
+            st.markdown("#### Key Divergences: Where We Differ Most from DataGolf")
+            st.caption("Top 10 players where our proprietary rank most disagrees with DataGolf.")
+
+            with_delta = [p for p in prop_players if abs(p.rank_delta) >= 2]
+            top_div = sorted(with_delta, key=lambda p: abs(p.rank_delta), reverse=True)[:10]
+
+            if not top_div:
+                st.info("No significant divergences (all players within 1 rank of DataGolf).")
+            else:
+                div_records = []
+                for p in top_div:
+                    direction = "We rank HIGHER" if p.rank_delta > 0 else "We rank LOWER"
+                    hist_parts = []
+                    for yr in [2025, 2024, 2023]:
+                        fin = p.finish_history.get(yr, "—")
+                        hist_parts.append(f"{yr}: {fin}")
+
+                    div_records.append({
+                        "Player":    dg_name_to_display(p.player_name),
+                        "DG#":       p.dg_rank,
+                        "Prop#":     p.proprietary_rank,
+                        "Δ":         _fmt_delta(p.rank_delta),
+                        "Direction": direction,
+                        "DG Win%":   fmt_pct(p.dg_win_prob_history),
+                        "Prop Win%": fmt_pct(p.proprietary_win_prob),
+                        "Market%":   fmt_pct(p.market_consensus_prob) if p.market_consensus_prob is not None else "—",
+                        "Kalshi%":   fmt_pct(p.kalshi_win_prob) if p.kalshi_win_prob is not None else "—",
+                        "Crs Score": f"{p.recency_course_score:.2f}" if p.recency_course_score is not None else "—",
+                        "History":   "  |  ".join(hist_parts),
+                    })
+
+                div_df = pd.DataFrame(div_records)
+
+                def _color_direction(val: str) -> str:
+                    if "HIGHER" in str(val):
+                        return "background-color: #2ecc71; color: white; font-weight: bold"
+                    if "LOWER" in str(val):
+                        return "background-color: #e74c3c; color: white; font-weight: bold"
+                    return ""
+
+                styled_div = div_df.style.applymap(_color_direction, subset=["Direction"])
+                st.dataframe(styled_div, use_container_width=True, hide_index=True)
