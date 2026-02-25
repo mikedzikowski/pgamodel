@@ -253,6 +253,44 @@ def fmt_edge(v) -> str:
     return f"{sign}{v*100:.1f}%"
 
 
+def build_prop_tooltip(p) -> str:
+    """Build the hover tooltip text showing how Prop Win% was calculated."""
+    w = p.weights_used
+    lines = []
+    dg_pct  = p.dg_win_prob_history * 100
+    dg_wt   = w.get("dg", 0) * 100
+    dg_cont = p.dg_win_prob_history * w.get("dg", 0) * 100
+    lines.append(f"{'DG Skill+Hist':14s} ({dg_wt:4.0f}%):  {dg_pct:5.2f}%  →  {dg_cont:5.2f}%")
+
+    mkt = p.market_consensus_prob
+    mkt_wt = w.get("market", 0) * 100
+    if mkt is not None and mkt_wt > 0:
+        mkt_cont = mkt * w["market"] * 100
+        lines.append(f"{'DraftKings':14s} ({mkt_wt:4.0f}%):  {mkt*100:5.2f}%  →  {mkt_cont:5.2f}%")
+    elif mkt_wt == 0:
+        lines.append(f"{'DraftKings':14s}  (  0%):  n/a")
+
+    kal = p.kalshi_win_prob
+    kal_wt = w.get("kalshi", 0) * 100
+    if kal is not None and kal_wt > 0:
+        kal_cont = kal * w["kalshi"] * 100
+        lines.append(f"{'Kalshi':14s} ({kal_wt:4.0f}%):  {kal*100:5.2f}%  →  {kal_cont:5.2f}%")
+    elif kal_wt == 0:
+        lines.append(f"{'Kalshi':14s}  (  0%):  n/a")
+
+    crs = p.recency_course_score
+    crs_wt = w.get("history", 0) * 100
+    if crs is not None and crs_wt > 0:
+        crs_cont = crs * w["history"] * 100
+        lines.append(f"{'Crs Score':14s} ({crs_wt:4.0f}%):  {crs:5.2f}   →  {crs_cont:5.2f}%")
+    elif crs_wt == 0:
+        lines.append(f"{'Crs Score':14s}  (  0%):  n/a")
+
+    lines.append("─" * 40)
+    lines.append(f"{'Prop Win%':14s}         {p.proprietary_win_prob*100:5.2f}%")
+    return "\n".join(lines)
+
+
 # ──────────────────────────────────────────────
 # Page setup
 # ──────────────────────────────────────────────
@@ -281,6 +319,26 @@ st.markdown("""
         background: #2d1b00; border-left: 4px solid #f39c12;
         padding: 10px 16px; border-radius: 4px; margin: 8px 0;
         color: #f9ca24;
+    }
+    /* Proprietary model HTML table */
+    .prop-table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+    .prop-table th {
+        background: #1e1e2e; color: #bbb; padding: 6px 10px;
+        text-align: left; border-bottom: 2px solid #444; white-space: nowrap;
+    }
+    .prop-table td { padding: 5px 10px; border-bottom: 1px solid #2a2a3a; white-space: nowrap; }
+    .prop-table tr:hover td { background-color: rgba(255,255,255,0.04); }
+    .prop-table .used td { opacity: 0.35; text-decoration: line-through; }
+    /* Tooltip on Prop Win% cells */
+    .prop-table .tip { position: relative; cursor: help; border-bottom: 1px dashed #888; }
+    .prop-table .tip:hover::after {
+        content: attr(data-tip);
+        position: absolute; left: 0; top: 110%;
+        white-space: pre; font-family: 'Courier New', monospace; font-size: 0.76rem;
+        background: #12122a; color: #e8e8f0;
+        border: 1px solid #555; border-radius: 6px;
+        padding: 10px 14px; z-index: 9999; min-width: 340px;
+        box-shadow: 3px 3px 12px rgba(0,0,0,0.7); pointer-events: none;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -985,61 +1043,49 @@ its weight is set to 0 and the remaining weights scale up proportionally to alwa
                 sign = "+" if v > 0 else ""
                 return f"{sign}{v}"
 
-            prop_records = []
+            def _delta_style(delta: int) -> str:
+                if delta >= 5:  return "background:#2ecc71;color:white;font-weight:bold"
+                if delta >= 2:  return "background:#a8e6cf;color:black"
+                if delta <= -5: return "background:#e74c3c;color:white;font-weight:bold"
+                if delta <= -2: return "background:#fab1a0;color:black"
+                return ""
+
+            headers = ["Prop#", "Δ vs DG", "Player", "Used", "Prop Win% ⓘ",
+                       "DG Win%", "DK Odds", "Market%", "Kalshi%", "Crs Score", "Weights"]
+            th = "".join(f"<th>{h}</th>" for h in headers)
+
+            rows_html = []
             for p in prop_players:
                 is_used = p.dg_id in used_player_ids
                 w = p.weights_used
-                wt_str = (
-                    f"DG{w.get('dg', 0)*100:.0f}/"
-                    f"Mkt{w.get('market', 0)*100:.0f}/"
-                    f"Kal{w.get('kalshi', 0)*100:.0f}/"
-                    f"Hist{w.get('history', 0)*100:.0f}"
+                wt_str = (f"DG{w.get('dg',0)*100:.0f}/"
+                          f"Mkt{w.get('market',0)*100:.0f}/"
+                          f"Kal{w.get('kalshi',0)*100:.0f}/"
+                          f"Hist{w.get('history',0)*100:.0f}")
+                tip = build_prop_tooltip(p).replace('"', '&quot;')
+                delta_s = _delta_style(p.rank_delta)
+                rows_html.append(
+                    f'<tr{"  class=\"used\"" if is_used else ""}>'
+                    f"<td>{p.proprietary_rank}</td>"
+                    f'<td style="{delta_s}">{_fmt_delta(p.rank_delta)}</td>'
+                    f"<td>{dg_name_to_display(p.player_name)}</td>"
+                    f'<td>{"✓" if is_used else ""}</td>'
+                    f'<td class="tip" data-tip="{tip}">{fmt_pct(p.proprietary_win_prob)}</td>'
+                    f"<td>{fmt_pct(p.dg_win_prob_history)}</td>"
+                    f"<td>{fmt_american(getattr(p, 'dk_raw_prob', None))}</td>"
+                    f'<td>{"—" if p.market_consensus_prob is None else fmt_pct(p.market_consensus_prob)}</td>'
+                    f'<td>{"—" if p.kalshi_win_prob is None else fmt_pct(p.kalshi_win_prob)}</td>'
+                    f'<td>{"—" if p.recency_course_score is None else f"{p.recency_course_score:.2f}"}</td>'
+                    f'<td style="color:#888;font-size:0.75rem">{wt_str}</td>'
+                    f"</tr>"
                 )
-                prop_records.append({
-                    "Prop#":     p.proprietary_rank,
-                    "Δ vs DG":   _fmt_delta(p.rank_delta),
-                    "Player":    dg_name_to_display(p.player_name),
-                    "Used":      "✓" if is_used else "",
-                    "Prop Win%": fmt_pct(p.proprietary_win_prob),
-                    "DG Win%":   fmt_pct(p.dg_win_prob_history),
-                    "DK Odds":   fmt_american(getattr(p, "dk_raw_prob", None)),
-                    "Market%":   fmt_pct(p.market_consensus_prob) if p.market_consensus_prob is not None else "—",
-                    "Kalshi%":   fmt_pct(p.kalshi_win_prob) if p.kalshi_win_prob is not None else "—",
-                    "Crs Score": f"{p.recency_course_score:.2f}" if p.recency_course_score is not None else "—",
-                    "Weights":   wt_str,
-                })
 
-            prop_df = pd.DataFrame(prop_records)
-
-            def _color_delta(val: str) -> str:
-                if val == "—":
-                    return ""
-                try:
-                    num = int(str(val).replace("+", ""))
-                    if num >= 5:
-                        return "background-color: #2ecc71; color: white; font-weight: bold"
-                    if num >= 2:
-                        return "background-color: #a8e6cf; color: black"
-                    if num <= -5:
-                        return "background-color: #e74c3c; color: white; font-weight: bold"
-                    if num <= -2:
-                        return "background-color: #fab1a0; color: black"
-                except (ValueError, TypeError):
-                    pass
-                return ""
-
-            def _color_prop_row(row):
-                if row["Used"] == "✓":
-                    return ["opacity: 0.4; text-decoration: line-through"] * len(row)
-                return [""] * len(row)
-
-            styled_prop = (
-                prop_df.style
-                .apply(_color_prop_row, axis=1)
-                .applymap(_color_delta, subset=["Δ vs DG"])
+            prop_html = (
+                '<div style="overflow-y:auto;max-height:600px;overflow-x:auto">'
+                f'<table class="prop-table"><thead><tr>{th}</tr></thead>'
+                f'<tbody>{"".join(rows_html)}</tbody></table></div>'
             )
-
-            st.dataframe(styled_prop, use_container_width=True, height=600, hide_index=True)
+            st.markdown(prop_html, unsafe_allow_html=True)
             st.caption(
                 "**Prop#** = our rank  |  "
                 "**Δ vs DG** = DG rank minus our rank "
