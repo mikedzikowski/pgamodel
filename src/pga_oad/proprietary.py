@@ -25,9 +25,9 @@ from .kalshi import KalshiClient
 HISTORY_YEARS = [2025, 2024, 2023, 2022, 2021]
 
 YEAR_WEIGHTS: dict[int, int] = {
-    2025: 5,
-    2024: 4,
-    2023: 3,
+    2025: 16,
+    2024: 8,
+    2023: 4,
     2022: 2,
     2021: 1,
 }

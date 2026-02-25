@@ -915,9 +915,9 @@ Each finish is scored and multiplied by a recency year weight:
 
 | Finish | Score | Year | Weight |
 |--------|-------|------|--------|
-| Win | 100 | 2025 | 5× |
-| T2–T5 | 65 | 2024 | 4× |
-| T6–T10 | 35 | 2023 | 3× |
+| Win | 100 | 2025 | 16× |
+| T2–T5 | 65 | 2024 | 8× |
+| T6–T10 | 35 | 2023 | 4× |
 | T11–T20 | 15 | 2022 | 2× |
 | T21–T30 | 5 | 2021 | 1× |
 | CUT/WD/DQ | 0 | — | — |
