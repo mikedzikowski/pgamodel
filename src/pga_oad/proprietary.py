@@ -129,7 +129,9 @@ class ProprietaryModel:
             dg_base_win = float(base.get("win", 0.0))
             dg_hist_win = float(history_fit_map.get(dg_id, {}).get("win", dg_base_win))
 
-            market_prob = self._match_player_name(player_name, market_probs)
+            # Outright odds API uses the same "Last, First" format as predictions — direct lookup
+            market_prob = market_probs.get(player_name)
+            # Kalshi uses "First Last" format — needs name conversion
             kalshi_prob = self._match_player_name(player_name, kalshi_probs)
             course_score = course_score_map.get(dg_id)
             finish_hist = finish_history_map.get(dg_id, {})
