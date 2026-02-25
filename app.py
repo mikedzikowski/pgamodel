@@ -1080,7 +1080,7 @@ proportionally to always sum to 100%.
                 if delta <= -2: return "background:#fab1a0;color:black"
                 return ""
 
-            headers = ["Prop#", "Δ vs DG", "Player", "Used", "Prop Win% ⓘ",
+            headers = ["Prop#", "Δ vs DG", "Player ⓘ", "Used", "Prop Win%",
                        "DG Win%", "DK Odds", "Market%", "Kalshi%", "Form", "Crs Score", "Weights"]
             th = "".join(f"<th>{h}</th>" for h in headers)
 
@@ -1100,9 +1100,9 @@ proportionally to always sum to 100%.
                     f'<tr{"  class=\"used\"" if is_used else ""}>'
                     f"<td>{p.proprietary_rank}</td>"
                     f'<td style="{delta_s}">{_fmt_delta(p.rank_delta)}</td>'
-                    f"<td>{dg_name_to_display(p.player_name)}</td>"
+                    f'<td class="tip" data-tip="{tip}">{dg_name_to_display(p.player_name)}</td>'
                     f'<td>{"✓" if is_used else ""}</td>'
-                    f'<td class="tip" data-tip="{tip}">{fmt_pct(p.proprietary_win_prob)}</td>'
+                    f"<td>{fmt_pct(p.proprietary_win_prob)}</td>"
                     f"<td>{fmt_pct(p.dg_win_prob_history)}</td>"
                     f"<td>{fmt_american(getattr(p, 'dk_raw_prob', None))}</td>"
                     f'<td>{"—" if p.market_consensus_prob is None else fmt_pct(p.market_consensus_prob)}</td>'
@@ -1120,6 +1120,7 @@ proportionally to always sum to 100%.
             )
             st.markdown(prop_html, unsafe_allow_html=True)
             st.caption(
+                "**Player ⓘ** = hover for signal breakdown  |  "
                 "**Prop#** = our rank  |  "
                 "**Δ vs DG** = DG rank minus our rank "
                 "(green = we rank higher / more bullish, red = we rank lower / more bearish)  |  "
