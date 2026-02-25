@@ -61,6 +61,7 @@ class ProprietaryPlayer:
     dg_win_prob: float                        # DG baseline model
     dg_win_prob_history: float                # DG skill + course history model
     market_consensus_prob: Optional[float]    # Vig-free sportsbook consensus
+    dk_raw_prob: Optional[float]              # Raw DraftKings implied prob (with vig, for display)
     kalshi_win_prob: Optional[float]          # Kalshi implied probability
     recency_course_score: Optional[float]     # 0.0–1.0 recency-weighted history
 
@@ -118,6 +119,7 @@ class ProprietaryModel:
 
         # ── Compute signals ────────────────────────────────────────────────
         market_probs = self._compute_market_consensus(odds_data)
+        dk_raw_probs = self._extract_dk_raw(odds_data)
         raw_course_scores, finish_history_map = self._compute_course_scores(history_map)
         course_score_map = self._normalize_course_scores(raw_course_scores)
 
@@ -131,6 +133,7 @@ class ProprietaryModel:
 
             # Outright odds API uses the same "Last, First" format as predictions — direct lookup
             market_prob = market_probs.get(player_name)
+            dk_raw = dk_raw_probs.get(player_name)
             # Kalshi uses "First Last" format — needs name conversion
             kalshi_prob = self._match_player_name(player_name, kalshi_probs)
             course_score = course_score_map.get(dg_id)
@@ -156,6 +159,7 @@ class ProprietaryModel:
                 dg_win_prob=dg_base_win,
                 dg_win_prob_history=dg_hist_win,
                 market_consensus_prob=market_prob,
+                dk_raw_prob=dk_raw,
                 kalshi_win_prob=kalshi_prob,
                 recency_course_score=course_score,
                 proprietary_win_prob=prop_prob,
@@ -249,6 +253,22 @@ class ProprietaryModel:
             return {}
 
         return {name: prob / total for name, prob in raw_probs.items()}
+
+    @staticmethod
+    def _extract_dk_raw(odds_data: dict) -> dict[str, float]:
+        """
+        Extract raw DraftKings implied probabilities (before vig removal) for display.
+
+        Returns:
+            {player_name: raw_dk_implied_prob}  — includes vig, use for American odds display only
+        """
+        result: dict[str, float] = {}
+        for entry in odds_data.get("odds", []):
+            name = entry.get("player_name", "")
+            dk = entry.get("draftkings")
+            if name and dk is not None and isinstance(dk, (int, float)) and float(dk) > 0:
+                result[name] = float(dk)
+        return result
 
     def _compute_course_scores(
         self,

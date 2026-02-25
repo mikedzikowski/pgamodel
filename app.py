@@ -237,6 +237,15 @@ def fmt_pct(v, decimals=1) -> str:
     return f"{v*100:.{decimals}f}%"
 
 
+def fmt_american(implied_prob: float | None) -> str:
+    """Convert implied probability (with vig) to American odds string, e.g. +1800 or -150."""
+    if implied_prob is None or implied_prob <= 0 or implied_prob >= 1:
+        return "—"
+    if implied_prob < 0.5:
+        return f"+{round((1 / implied_prob - 1) * 100)}"
+    return f"{round(-implied_prob / (1 - implied_prob) * 100)}"
+
+
 def fmt_edge(v) -> str:
     if v is None:
         return "—"
@@ -993,6 +1002,7 @@ its weight is set to 0 and the remaining weights scale up proportionally to alwa
                     "Used":      "✓" if is_used else "",
                     "Prop Win%": fmt_pct(p.proprietary_win_prob),
                     "DG Win%":   fmt_pct(p.dg_win_prob_history),
+                    "DK Odds":   fmt_american(p.dk_raw_prob),
                     "Market%":   fmt_pct(p.market_consensus_prob) if p.market_consensus_prob is not None else "—",
                     "Kalshi%":   fmt_pct(p.kalshi_win_prob) if p.kalshi_win_prob is not None else "—",
                     "Crs Score": f"{p.recency_course_score:.2f}" if p.recency_course_score is not None else "—",
@@ -1066,6 +1076,7 @@ its weight is set to 0 and the remaining weights scale up proportionally to alwa
                         "Direction": direction,
                         "DG Win%":   fmt_pct(p.dg_win_prob_history),
                         "Prop Win%": fmt_pct(p.proprietary_win_prob),
+                        "DK Odds":   fmt_american(p.dk_raw_prob),
                         "Market%":   fmt_pct(p.market_consensus_prob) if p.market_consensus_prob is not None else "—",
                         "Kalshi%":   fmt_pct(p.kalshi_win_prob) if p.kalshi_win_prob is not None else "—",
                         "Crs Score": f"{p.recency_course_score:.2f}" if p.recency_course_score is not None else "—",
