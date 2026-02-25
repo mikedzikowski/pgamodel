@@ -67,6 +67,13 @@ def load_kalshi_win(event_code: str) -> tuple[dict[str, float], set[str]]:
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
+def load_kalshi_raw(event_code: str, market: str) -> list[dict]:
+    """Returns raw market data list for a given market type."""
+    client = KalshiClient(cache_dir=CACHE_DIR)
+    return client.get_market_data(event_code, market)
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
 def detect_kalshi_event_code() -> str | None:
     client = KalshiClient(cache_dir=CACHE_DIR)
     return client.detect_current_event_code()
@@ -391,8 +398,8 @@ st.divider()
 # ──────────────────────────────────────────────
 # Tabs
 # ──────────────────────────────────────────────
-tab1, tab2, tab3, tab4 = st.tabs(
-    ["📊 Full Field", "🏌️ Course History", "📈 DG vs Kalshi", "🎯 OAD Pick"]
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    ["📊 Full Field", "🏌️ Course History", "📈 DG vs Kalshi", "🎯 OAD Pick", "💰 Kalshi Markets"]
 )
 
 
@@ -742,3 +749,102 @@ with tab4:
                 "Event ID": e.get("event_id", ""),
             } for e in schedule[:20]])
             st.dataframe(sched_df, hide_index=True, use_container_width=True)
+
+
+# ══════════════════════════════════════════════
+# TAB 5 — Kalshi Markets
+# ══════════════════════════════════════════════
+with tab5:
+    st.subheader("Kalshi Prediction Markets — Raw Prices")
+
+    if not event_code:
+        st.warning("No open Kalshi golf markets detected.")
+    else:
+        st.caption(f"Event code: **{event_code}**  |  Prices in cents (0–100).  "
+                   "Mid = (Bid + Ask) / 2.  No = 100 − Yes.")
+
+        MARKET_LABELS = {
+            "win":      "🏆 Tournament Winner",
+            "top5":     "Top 5 Finish",
+            "top10":    "Top 10 Finish",
+            "top20":    "Top 20 Finish",
+            "make_cut": "Make the Cut",
+        }
+
+        selected_market = st.selectbox(
+            "Market type",
+            options=list(MARKET_LABELS.keys()),
+            format_func=lambda k: MARKET_LABELS[k],
+        )
+
+        with st.spinner(f"Loading {MARKET_LABELS[selected_market]} markets..."):
+            raw_data = load_kalshi_raw(event_code, selected_market)
+
+        if not raw_data:
+            st.info(f"No {MARKET_LABELS[selected_market]} markets found for event {event_code}.")
+        else:
+            # Build display rows
+            mkt_records = []
+            for m in raw_data:
+                yes_bid   = m["yes_bid"]    # cents
+                yes_ask   = m["yes_ask"]    # cents
+                last      = m["last_price"] # cents
+                mid       = round((yes_bid + yes_ask) / 2, 1) if yes_bid and yes_ask else None
+                no_bid    = (100 - yes_ask) if yes_ask else None
+                no_ask    = (100 - yes_bid) if yes_bid else None
+                implied   = m["raw_prob"]
+                thin      = m["thin"]
+
+                mkt_records.append({
+                    "Player":       m["player_name"],
+                    "Yes Bid":      yes_bid  if yes_bid  else "—",
+                    "Yes Ask":      yes_ask  if yes_ask  else "—",
+                    "Mid":          mid      if mid is not None else "—",
+                    "No Bid":       no_bid   if no_bid is not None else "—",
+                    "No Ask":       no_ask   if no_ask is not None else "—",
+                    "Last":         last     if last    else "—",
+                    "Implied%":     f"{implied*100:.1f}%" if implied else "—",
+                    "Liquid":       "✅" if not thin else "⚠️ thin",
+                    "_implied_raw": implied,
+                    "_thin":        thin,
+                })
+
+            # Sort by implied prob descending (liquid first, then thin)
+            mkt_records.sort(key=lambda r: (r["_thin"], -r["_implied_raw"]))
+
+            mkt_df = pd.DataFrame([{k: v for k, v in r.items() if not k.startswith("_")} for r in mkt_records])
+
+            def color_liquid(val):
+                if val == "✅":
+                    return "background-color: #e8f5e9; color: #2e7d32"
+                if "thin" in str(val):
+                    return "background-color: #fff3e0; color: #e65100"
+                return ""
+
+            def color_bid_ask(val):
+                if val == "—":
+                    return "color: #aaa"
+                return ""
+
+            styled_mkt = (
+                mkt_df.style
+                .applymap(color_liquid, subset=["Liquid"])
+                .applymap(color_bid_ask, subset=["Yes Bid", "Yes Ask", "No Bid", "No Ask", "Last"])
+            )
+
+            liquid_count = sum(1 for r in mkt_records if not r["_thin"])
+            thin_count   = sum(1 for r in mkt_records if r["_thin"])
+
+            col_l, col_t, col_i = st.columns(3)
+            col_l.metric("Liquid markets", liquid_count)
+            col_t.metric("Thin markets",   thin_count)
+            col_i.metric("Total players",  len(mkt_records))
+
+            st.dataframe(styled_mkt, use_container_width=True, height=550, hide_index=True)
+
+            st.caption(
+                "**Yes Bid/Ask** = prices to buy/sell a YES contract (cents).  "
+                "**No Bid/Ask** = 100 − Yes Ask / 100 − Yes Bid.  "
+                "**Mid** = fair-value estimate.  "
+                "**⚠️ thin** = no active quotes (floor-price artifact, excluded from blended model)."
+            )
