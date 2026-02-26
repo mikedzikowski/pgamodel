@@ -617,7 +617,7 @@ with st.sidebar:
         st.caption("Sign in to access PRO and ELITE features.")
         if _OIDC_AVAILABLE:
             if st.button("Sign in with Google", use_container_width=True, type="primary"):
-                st.login("google")
+                st.login()
         else:
             st.caption("_Auth requires Streamlit ≥ 1.41. Redeploying…_")
     else:
