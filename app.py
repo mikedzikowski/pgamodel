@@ -90,7 +90,10 @@ def _sync_oauth_user() -> None:
 def _do_logout():
     for k in ("user_id", "username", "email", "tier_name"):
         st.session_state.pop(k, None)
-    st.logout()   # clears the OIDC cookie; triggers automatic rerun
+    if hasattr(st, "logout"):
+        st.logout()   # clears the OIDC cookie; triggers automatic rerun
+    else:
+        st.rerun()
 
 
 def _upgrade_tier(new_tier: str):
@@ -536,12 +539,16 @@ display_to_dg_id = {dg_name_to_display(p.player_name): p.dg_id for p in predicti
 
 # ──────────────────────────────────────────────
 # OAuth identity sync (runs on every page load)
+# Requires Streamlit >= 1.41 for OIDC support.
 # ──────────────────────────────────────────────
-if st.user.is_logged_in and not st.session_state.get("user_id"):
-    _sync_oauth_user()
-elif not st.user.is_logged_in and st.session_state.get("user_id"):
-    for _k in ("user_id", "username", "email", "tier_name"):
-        st.session_state.pop(_k, None)
+_OIDC_AVAILABLE = hasattr(st.user, "is_logged_in")
+
+if _OIDC_AVAILABLE:
+    if st.user.is_logged_in and not st.session_state.get("user_id"):
+        _sync_oauth_user()
+    elif not st.user.is_logged_in and st.session_state.get("user_id"):
+        for _k in ("user_id", "username", "email", "tier_name"):
+            st.session_state.pop(_k, None)
 
 
 # ──────────────────────────────────────────────
@@ -605,10 +612,14 @@ with st.sidebar:
     st.divider()
     st.markdown("**Account**")
 
-    if not st.user.is_logged_in:
+    _is_logged_in = _OIDC_AVAILABLE and st.user.is_logged_in
+    if not _is_logged_in:
         st.caption("Sign in to access PRO and ELITE features.")
-        if st.button("Sign in with Google", use_container_width=True, type="primary"):
-            st.login("google")
+        if _OIDC_AVAILABLE:
+            if st.button("Sign in with Google", use_container_width=True, type="primary"):
+                st.login("google")
+        else:
+            st.caption("_Auth requires Streamlit ≥ 1.41. Redeploying…_")
     else:
         _tier_name = st.session_state.get("tier_name", "free")
         _tier_badge = {"free": "🆓 FREE", "pro": "⭐ PRO", "elite": "💎 ELITE"}.get(
