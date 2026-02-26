@@ -37,6 +37,24 @@ HISTORY_YEARS = [2025, 2024, 2023, 2022, 2021]
 CACHE_DIR = "data/raw"
 _TIER_ORDER = {"free": 0, "pro": 1, "elite": 2}
 
+COURSE_TAGS: dict[int, dict[str, str]] = {
+    6:   {"turf": "bermuda",   "style": "parkland"},   # Sony Open – Waialae
+    12:  {"turf": "bermuda",   "style": "parkland"},   # Sentry – Plantation Course
+    14:  {"turf": "bermuda",   "style": "parkland"},   # Honda Classic – PGA National
+    19:  {"turf": "poa",       "style": "coastal"},    # Farmers Insurance – Torrey Pines
+    26:  {"turf": "bermuda",   "style": "desert"},     # WM Phoenix Open – TPC Scottsdale
+    33:  {"turf": "poa",       "style": "coastal"},    # AT&T Pebble Beach – links/coastal
+    34:  {"turf": "bermuda",   "style": "resort"},     # Genesis Invitational – Riviera
+    54:  {"turf": "bentgrass", "style": "parkland"},   # Arnold Palmer – Bay Hill
+    60:  {"turf": "bentgrass", "style": "parkland"},   # Players Championship – TPC Sawgrass
+    100: {"turf": "bentgrass", "style": "parkland"},   # The Masters – Augusta National
+    520: {"turf": "bentgrass", "style": "links"},      # US Open (varies)
+    533: {"turf": "bentgrass", "style": "parkland"},   # Memorial – Muirfield Village
+    562: {"turf": "bermuda",   "style": "parkland"},   # Travelers – TPC River Highlands
+    725: {"turf": "bentgrass", "style": "parkland"},   # FedEx St. Jude – TPC Southwind
+    748: {"turf": "bentgrass", "style": "parkland"},   # BMW Championship – various
+}
+
 
 # ──────────────────────────────────────────────
 # Database init (once per process)
@@ -170,6 +188,37 @@ def load_course_history(event_id: int) -> dict[int, dict[int, dict]]:
     return history
 
 
+@st.cache_data(ttl=900, show_spinner=False)
+def load_outright_odds(market: str = "win") -> list[dict]:
+    """Returns the raw odds list from DataGolf betting-tools/outrights."""
+    client = DataGolfClient(cache_dir=CACHE_DIR)
+    data = client.get_outright_odds(tour="pga", market=market, odds_format="percent")
+    return data.get("odds", [])
+
+
+def _to_american(prob: float) -> str:
+    """Convert implied probability (0–1) to American odds string."""
+    if prob <= 0 or prob >= 1:
+        return "—"
+    if prob >= 0.5:
+        return f"-{round((prob / (1 - prob)) * 100)}"
+    return f"+{round(((1 - prob) / prob) * 100)}"
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def load_future_value_data(event_ids: tuple[int, ...]) -> dict[int, dict[int, dict[int, str]]]:
+    """Returns {event_id: {dg_id: {year: fin_text}}} for a list of upcoming events."""
+    result: dict[int, dict[int, dict[int, str]]] = {}
+    for eid in event_ids:
+        hist = load_course_history(eid)
+        per_player: dict[int, dict[int, str]] = {}
+        for year, players in hist.items():
+            for dg_id, p in players.items():
+                per_player.setdefault(dg_id, {})[year] = p.get("fin_text", "—")
+        result[eid] = per_player
+    return result
+
+
 @st.cache_data(ttl=1800, show_spinner=False)
 def load_kalshi_win(event_code: str) -> tuple[dict[str, float], set[str]]:
     """Returns (implied_probs, thin_player_names)."""
@@ -245,6 +294,41 @@ def finish_sort_key(fin: str) -> int:
         return int(clean)
     except ValueError:
         return {"CUT": 200, "MDF": 199, "WD": 300, "DQ": 300}.get(fin, 9999)
+
+
+def _course_fit_score(fins: dict[int, str]) -> float | None:
+    """
+    Convert historical finishes {year: fin_text} into a 0–1 course-fit score.
+    Uses recency weighting and position-based point values.
+    Returns None when there is no relevant data.
+    """
+    YEAR_W = {2025: 16, 2024: 8, 2023: 4, 2022: 2, 2021: 1}
+    POS_PTS = {1: 100, 2: 80, 3: 80, 4: 80, 5: 80,
+               6: 60, 7: 60, 8: 60, 9: 60, 10: 60}
+    total_w, total_s = 0.0, 0.0
+    for year, fin in fins.items():
+        w = YEAR_W.get(year, 0)
+        if not w:
+            continue
+        pos = finish_sort_key(fin)
+        if pos <= 10:
+            pts = POS_PTS.get(pos, 60)
+        elif pos <= 20:
+            pts = 40
+        elif pos <= 30:
+            pts = 20
+        elif pos >= 9000:
+            if fin in ("CUT", "WD", "DQ"):
+                pts = 0
+            else:
+                continue  # "—" = not in field, skip
+        else:
+            pts = 10
+        total_w += w
+        total_s += w * pts
+    if total_w == 0:
+        return None
+    return total_s / (total_w * 100)
 
 
 def finish_badge(fin: str) -> str:
@@ -680,13 +764,15 @@ st.divider()
 # ──────────────────────────────────────────────
 # Tabs
 # ──────────────────────────────────────────────
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
     "📊 Full Field",
     "🏌️ Course History",
     "📈 DG vs Kalshi",
     "🎯 OAD Pick",
     "💰 Kalshi Markets",
     "🔬 Proprietary Model",
+    "📅 Future Value",
+    "🏦 Sportsbook Odds",
 ])
 
 
@@ -1392,3 +1478,305 @@ proportionally to always sum to 100%.
     
                     styled_div = div_df.style.applymap(_color_direction, subset=["Direction"])
                     st.dataframe(styled_div, use_container_width=True, hide_index=True)
+
+# ──────────────────────────────────────────────
+# Tab 7 – Future Value
+# ──────────────────────────────────────────────
+with tab7:
+    if _tier_gate("pro", "Future Value"):
+        st.subheader("Future Value — Season Grid")
+        st.caption(
+            "Color-coded grid showing how well each player fits each remaining event. "
+            "Based on recency-weighted course history + course-type affinity. "
+            "Strikethrough rows = players already used this season."
+        )
+
+        col_a, col_b, col_c = st.columns(3)
+        fv_top_n   = col_a.slider("Top N players", 10, 80, 40, step=5, key="fv_top_n")
+        fv_avail   = col_b.checkbox("Available players only", value=True, key="fv_avail")
+        fv_type_wt = col_c.slider(
+            "Course-type weight %", 0, 100, 30, step=10, key="fv_type_wt",
+            help="0 = exact course history only · 100 = course-type affinity only",
+        )
+        type_w = fv_type_wt / 100
+        hist_w = 1.0 - type_w
+
+        upcoming = [e for e in schedule if e.get("status") != "completed"]
+        upcoming_eids = tuple(e["event_id"] for e in upcoming if e.get("event_id"))
+        upcoming_eids = upcoming_eids[:15]
+
+        if not upcoming_eids:
+            st.info("No upcoming events found on the schedule.")
+        else:
+            with st.spinner("Loading course history for remaining events…"):
+                fv_data = load_future_value_data(upcoming_eids)
+
+            # Course-type affinity: average fit across events sharing turf or style
+            def _type_affinity(dg_id: int, tag: dict[str, str]) -> float | None:
+                scores = []
+                for eid, player_map in fv_data.items():
+                    etag = COURSE_TAGS.get(eid, {})
+                    if etag.get("style") == tag.get("style") or etag.get("turf") == tag.get("turf"):
+                        s = _course_fit_score(player_map.get(dg_id, {}))
+                        if s is not None:
+                            scores.append(s)
+                return sum(scores) / len(scores) if scores else None
+
+            sorted_rows = sorted(rows, key=lambda r: r["dg_rank"])
+            if fv_avail:
+                sorted_rows = [r for r in sorted_rows if r["dg_id"] not in used_player_ids]
+            sorted_rows = sorted_rows[:fv_top_n]
+
+            # Build score matrix
+            matrix: dict[int, dict[int, float | None]] = {}
+            for r in sorted_rows:
+                dg_id = r["dg_id"]
+                row_scores: dict[int, float | None] = {}
+                for eid in upcoming_eids:
+                    fins = fv_data.get(eid, {}).get(dg_id, {})
+                    h_score = _course_fit_score(fins)
+                    tag = COURSE_TAGS.get(eid, {})
+                    t_score = _type_affinity(dg_id, tag) if tag else None
+                    if h_score is not None and t_score is not None:
+                        combined: float | None = hist_w * h_score + type_w * t_score
+                    elif h_score is not None:
+                        combined = h_score
+                    elif t_score is not None:
+                        combined = type_w * t_score
+                    else:
+                        combined = None
+                    row_scores[eid] = combined
+                matrix[dg_id] = row_scores
+
+            # Build ordered event labels from upcoming (preserving schedule order)
+            event_labels: list[tuple[int, str, str]] = []
+            seen_eids: set[int] = set()
+            for e in upcoming:
+                eid = e.get("event_id")
+                if eid in upcoming_eids and eid not in seen_eids:
+                    name = (e.get("event_name") or "")[:20]
+                    date = (e.get("start_date") or "")[:10]
+                    event_labels.append((eid, name, date))
+                    seen_eids.add(eid)
+
+            def _cell_color(score: float | None) -> str:
+                if score is None:
+                    return "background:#3a3a3a;color:#888"
+                if score >= 0.70:
+                    return "background:#27ae60;color:white;font-weight:bold"
+                if score >= 0.50:
+                    return "background:#1e8449;color:white"
+                if score >= 0.30:
+                    return "background:#d4ac0d;color:black"
+                if score >= 0.10:
+                    return "background:#c0392b;color:white"
+                return "background:#922b21;color:white"
+
+            th_cols = "".join(
+                f'<th style="min-width:90px;padding:4px 6px;font-size:0.7rem;border:1px solid #444">'
+                f'{name}<br><span style="color:#aaa;font-weight:normal">{date}</span></th>'
+                for _, name, date in event_labels
+            )
+            headers_html = (
+                '<th style="padding:4px 8px;text-align:left;border:1px solid #444;min-width:140px">Player</th>'
+                + th_cols
+            )
+
+            rows_html_parts = []
+            for r in sorted_rows:
+                dg_id = r["dg_id"]
+                is_used = dg_id in used_player_ids
+                name_style = "color:#666;text-decoration:line-through" if is_used else "font-weight:bold"
+                cells = f'<td style="{name_style};padding:4px 8px;border:1px solid #333">{r["display_name"]}</td>'
+                for eid, _, _ in event_labels:
+                    score = matrix.get(dg_id, {}).get(eid)
+                    label = f"{score:.0%}" if score is not None else "—"
+                    cells += (
+                        f'<td style="text-align:center;padding:4px 6px;'
+                        f'border:1px solid #333;{_cell_color(score)}">{label}</td>'
+                    )
+                rows_html_parts.append(f"<tr>{cells}</tr>")
+
+            grid_html = (
+                '<div style="overflow:auto;max-height:620px;border:1px solid #444;border-radius:4px">'
+                '<table style="border-collapse:collapse;font-size:0.8rem;width:100%">'
+                '<thead><tr style="position:sticky;top:0;background:#1a1a2e;z-index:1">'
+                f"{headers_html}</tr></thead>"
+                f'<tbody>{"".join(rows_html_parts)}</tbody>'
+                "</table></div>"
+            )
+            st.markdown(grid_html, unsafe_allow_html=True)
+            st.caption(
+                "🟢 Strong fit (≥70%)  🟡 Moderate (30–50%)  🔴 Poor (<10%)  ⬜ No data.  "
+                "Score = recency-weighted course history blended with course-type affinity."
+            )
+
+# ══════════════════════════════════════════════
+# TAB 8 — Sportsbook Odds
+# ══════════════════════════════════════════════
+with tab8:
+    if _tier_gate("pro", "Sportsbook Odds"):
+        st.subheader("Sportsbook Odds Comparison")
+        st.caption(
+            "Live outright odds from major sportsbooks via DataGolf. "
+            "Sourced from bet365, BetMGM, Caesars, DraftKings, FanDuel, Pinnacle, and more. "
+            "**DG Edge** = DataGolf model win% minus best available implied probability. "
+            "Positive edge = model likes the player more than the market."
+        )
+
+        _SB_MARKET_LABELS = {
+            "win":    "🏆 Tournament Winner",
+            "top_5":  "Top 5 Finish",
+            "top_10": "Top 10 Finish",
+            "top_20": "Top 20 Finish",
+            "mc":     "Make the Cut",
+        }
+        _NON_BOOK = {"player_name", "dg_id", "consensus_prob", "datagolf"}
+
+        sb_col1, sb_col2, sb_col3 = st.columns(3)
+        sb_market = sb_col1.selectbox(
+            "Market",
+            options=list(_SB_MARKET_LABELS.keys()),
+            format_func=lambda k: _SB_MARKET_LABELS[k],
+            key="sb_market",
+        )
+        sb_fmt = sb_col2.radio(
+            "Odds format",
+            options=["American", "Implied %"],
+            horizontal=True,
+            key="sb_fmt",
+        )
+        sb_top_n = sb_col3.slider("Top N players", 10, 80, 40, step=5, key="sb_top_n")
+
+        sb_avail = st.checkbox(
+            "Available players only (hide used)", value=False, key="sb_avail"
+        )
+
+        with st.spinner(f"Loading {_SB_MARKET_LABELS[sb_market]} odds…"):
+            sb_odds_raw = load_outright_odds(sb_market)
+
+        if not sb_odds_raw:
+            st.info("No sportsbook odds available for this event yet. Check back closer to tournament start.")
+        else:
+            # Discover which sportsbooks have data (at least one player with a non-zero value)
+            all_book_keys: list[str] = []
+            for entry in sb_odds_raw:
+                for k, v in entry.items():
+                    if k not in _NON_BOOK and k not in all_book_keys and isinstance(v, (int, float)) and v > 0:
+                        all_book_keys.append(k)
+            # Deduplicate while preserving order, priority books first
+            priority = ["draftkings", "fanduel", "betmgm", "caesars", "bet365", "pinnacle"]
+            other_books = [b for b in all_book_keys if b not in priority]
+            book_cols = [b for b in priority if b in all_book_keys] + sorted(other_books)
+
+            # Build dg_id → model win prob lookup
+            dg_win_lookup: dict[int, float] = {
+                p.dg_id: p.win_prob for p in predictions if sb_market == "win"
+            }
+            dg_rank_lookup: dict[int, int] = {p.dg_id: p.dg_rank for p in predictions}
+
+            def _fmt(prob: float | None) -> str:
+                if prob is None or prob <= 0:
+                    return "—"
+                if sb_fmt == "American":
+                    return _to_american(prob)
+                return f"{prob * 100:.1f}%"
+
+            sb_records = []
+            for entry in sb_odds_raw:
+                dg_id = entry.get("dg_id")
+                name_dg = entry.get("player_name", "")
+                display = dg_name_to_display(name_dg)
+                is_used = dg_id in used_player_ids if dg_id else False
+
+                if sb_avail and is_used:
+                    continue
+
+                # Collect per-book implied probs
+                book_probs: dict[str, float | None] = {}
+                for bk in book_cols:
+                    val = entry.get(bk)
+                    book_probs[bk] = float(val) if isinstance(val, (int, float)) and val > 0 else None
+
+                valid_probs = [v for v in book_probs.values() if v is not None]
+                best_prob = max(valid_probs) if valid_probs else None  # best = highest implied prob = shortest odds
+                dg_model = dg_win_lookup.get(dg_id) if dg_id and sb_market == "win" else None
+                dg_rank = dg_rank_lookup.get(dg_id, 999) if dg_id else 999
+
+                row: dict = {
+                    "Player":    display,
+                    "Used":      is_used,
+                    "_dg_rank":  dg_rank,
+                    "_best":     best_prob,
+                    "_dg_model": dg_model,
+                }
+                for bk in book_cols:
+                    row[bk.title()] = _fmt(book_probs.get(bk))
+                if valid_probs:
+                    row["Best"] = _fmt(best_prob)
+                else:
+                    row["Best"] = "—"
+                if dg_model is not None and best_prob is not None and sb_market == "win":
+                    edge = dg_model - best_prob
+                    row["DG Edge"] = f"{edge:+.1%}"
+                    row["_edge"] = edge
+                else:
+                    row["DG Edge"] = "—"
+                    row["_edge"] = 0.0
+                sb_records.append(row)
+
+            # Sort by DG rank
+            sb_records.sort(key=lambda r: r["_dg_rank"])
+            sb_records = sb_records[:sb_top_n]
+
+            if not sb_records:
+                st.info("No player data to display.")
+            else:
+                display_cols = ["Player"] + [b.title() for b in book_cols] + ["Best"]
+                if sb_market == "win":
+                    display_cols.append("DG Edge")
+
+                sb_df = pd.DataFrame([
+                    {c: r.get(c, "—") for c in display_cols} for r in sb_records
+                ])
+
+                def _style_edge(val: str) -> str:
+                    if val == "—" or not isinstance(val, str):
+                        return "color: #888"
+                    if val.startswith("+"):
+                        try:
+                            v = float(val.replace("+", "").replace("%", ""))
+                            if v >= 3:
+                                return "background-color: #1a5c2e; color: #7dffaa; font-weight: bold"
+                            if v >= 1:
+                                return "background-color: #1e3d2f; color: #a8e6c3"
+                        except ValueError:
+                            pass
+                    if val.startswith("-"):
+                        try:
+                            v = float(val.replace("-", "").replace("%", ""))
+                            if v >= 3:
+                                return "color: #e74c3c"
+                        except ValueError:
+                            pass
+                    return ""
+
+                def _style_best(val: str) -> str:
+                    if val not in ("—", "") and val:
+                        return "font-weight: bold; color: #f9ca24"
+                    return "color: #888"
+
+                styled_sb = sb_df.style
+                if "DG Edge" in display_cols:
+                    styled_sb = styled_sb.applymap(_style_edge, subset=["DG Edge"])
+                styled_sb = styled_sb.applymap(_style_best, subset=["Best"])
+
+                st.dataframe(styled_sb, use_container_width=True, hide_index=True)
+
+                if sb_market == "win":
+                    positive_edge = [r for r in sb_records if r.get("_edge", 0) > 0.01]
+                    if positive_edge:
+                        st.markdown(
+                            f"**{len(positive_edge)} player(s)** where DataGolf model > best available odds "
+                            "(potential market value)."
+                        )
