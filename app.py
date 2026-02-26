@@ -72,7 +72,7 @@ def _sync_oauth_user() -> None:
             while get_user_by_username(db, username):
                 username = f"{base}_{suffix}"
                 suffix += 1
-            user = create_user(db, email, username, password_hash=None)
+            user = create_user(db, email, username, password_hash="")
             db.commit()
         sub = get_subscription(db, user.id)
         tier = sub.tier if (sub and sub.is_active) else "free"
