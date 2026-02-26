@@ -11,7 +11,7 @@ from .models import BacktestRun, Pick, PickResult, Subscription, User
 
 # ── Users ────────────────────────────────────────────────────────────────────
 
-def create_user(db: Session, email: str, username: str, password_hash: str) -> User:
+def create_user(db: Session, email: str, username: str, password_hash: Optional[str] = None) -> User:
     user = User(email=email, username=username, password_hash=password_hash)
     db.add(user)
     db.flush()  # ensure user.id is populated before referencing it

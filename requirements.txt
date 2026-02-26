@@ -4,7 +4,7 @@ pydantic[email]>=2.5
 python-dotenv>=1.0
 PuLP>=2.8
 pandas>=2.1
-streamlit>=1.32
+streamlit[auth]>=1.41
 plotly>=5.20
 # API & Auth
 fastapi>=0.109

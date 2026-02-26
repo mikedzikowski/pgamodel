@@ -22,7 +22,6 @@ from pga_oad.models import Prediction
 
 # Auth / DB / subscription imports
 from sqlalchemy.orm import sessionmaker
-from pga_oad.api.auth import hash_password, verify_password
 from pga_oad.db.engine import init_db, get_engine
 from pga_oad.db.crud import (
     create_user, get_user_by_email, get_user_by_username,
@@ -59,44 +58,31 @@ def _db():
 # Auth helpers
 # ──────────────────────────────────────────────
 
-def _do_login(email: str, password: str) -> str | None:
-    """Validate credentials and populate session_state. Returns error string or None."""
+def _sync_oauth_user() -> None:
+    """Called once per session after Google sign-in. Looks up or auto-creates the DB user."""
+    email = st.user.email.strip().lower()
     db = _db()
     try:
-        user = get_user_by_email(db, email.strip().lower())
-        if not user or not verify_password(password, user.password_hash):
-            return "Invalid email or password."
+        user = get_user_by_email(db, email)
+        if not user:
+            # First OAuth login — auto-create account with no password
+            name = getattr(st.user, "name", "") or email.split("@")[0]
+            base = name.replace(" ", "_").lower()[:30]
+            username, suffix = base, 1
+            while get_user_by_username(db, username):
+                username = f"{base}_{suffix}"
+                suffix += 1
+            user = create_user(db, email, username, password_hash=None)
+            db.commit()
         sub = get_subscription(db, user.id)
         tier = sub.tier if (sub and sub.is_active) else "free"
         st.session_state.user_id   = user.id
         st.session_state.username  = user.username
         st.session_state.email     = user.email
         st.session_state.tier_name = tier
-        return None
-    finally:
-        db.close()
-
-
-def _do_register(email: str, username: str, password: str) -> str | None:
-    """Create account and populate session_state. Returns error string or None."""
-    db = _db()
-    try:
-        if get_user_by_email(db, email.strip().lower()):
-            return "Email already registered."
-        if get_user_by_username(db, username.strip()):
-            return "Username already taken."
-        user = create_user(
-            db, email.strip().lower(), username.strip(), hash_password(password)
-        )
-        db.commit()
-        st.session_state.user_id   = user.id
-        st.session_state.username  = user.username
-        st.session_state.email     = user.email
-        st.session_state.tier_name = "free"
-        return None
-    except Exception as exc:
+    except Exception:
         db.rollback()
-        return str(exc)
+        raise
     finally:
         db.close()
 
@@ -104,6 +90,7 @@ def _do_register(email: str, username: str, password: str) -> str | None:
 def _do_logout():
     for k in ("user_id", "username", "email", "tier_name"):
         st.session_state.pop(k, None)
+    st.logout()   # clears the OIDC cookie; triggers automatic rerun
 
 
 def _upgrade_tier(new_tier: str):
@@ -548,6 +535,16 @@ display_to_dg_id = {dg_name_to_display(p.player_name): p.dg_id for p in predicti
 
 
 # ──────────────────────────────────────────────
+# OAuth identity sync (runs on every page load)
+# ──────────────────────────────────────────────
+if st.user.is_logged_in and not st.session_state.get("user_id"):
+    _sync_oauth_user()
+elif not st.user.is_logged_in and st.session_state.get("user_id"):
+    for _k in ("user_id", "username", "email", "tier_name"):
+        st.session_state.pop(_k, None)
+
+
+# ──────────────────────────────────────────────
 # Sidebar
 # ──────────────────────────────────────────────
 with st.sidebar:
@@ -608,38 +605,17 @@ with st.sidebar:
     st.divider()
     st.markdown("**Account**")
 
-    if not st.session_state.get("user_id"):
-        signin_tab, register_tab = st.tabs(["Sign In", "Register"])
-
-        with signin_tab:
-            with st.form("login_form"):
-                li_email    = st.text_input("Email", key="li_email")
-                li_password = st.text_input("Password", type="password", key="li_pass")
-                if st.form_submit_button("Sign In", use_container_width=True):
-                    err = _do_login(li_email, li_password)
-                    if err:
-                        st.error(err)
-                    else:
-                        st.rerun()
-
-        with register_tab:
-            with st.form("register_form"):
-                re_email    = st.text_input("Email", key="re_email")
-                re_username = st.text_input("Username", key="re_user")
-                re_password = st.text_input("Password", type="password", key="re_pass")
-                if st.form_submit_button("Create Account", use_container_width=True):
-                    err = _do_register(re_email, re_username, re_password)
-                    if err:
-                        st.error(err)
-                    else:
-                        st.rerun()
+    if not st.user.is_logged_in:
+        st.caption("Sign in to access PRO and ELITE features.")
+        if st.button("Sign in with Google", use_container_width=True, type="primary"):
+            st.login("google")
     else:
-        _tier_name = st.session_state.tier_name
+        _tier_name = st.session_state.get("tier_name", "free")
         _tier_badge = {"free": "🆓 FREE", "pro": "⭐ PRO", "elite": "💎 ELITE"}.get(
             _tier_name, _tier_name.upper()
         )
-        st.markdown(f"**👤 {st.session_state.username}**")
-        st.caption(st.session_state.email)
+        st.markdown(f"**👤 {st.session_state.get('username', '')}**")
+        st.caption(st.session_state.get("email", ""))
         st.markdown(f"Tier: **{_tier_badge}**")
 
         if _tier_name != "elite":
@@ -657,7 +633,7 @@ with st.sidebar:
         st.divider()
         if st.button("Sign Out", use_container_width=True):
             _do_logout()
-            st.rerun()
+            # st.logout() is called inside _do_logout(); rerun is automatic
 
 
 # ──────────────────────────────────────────────
