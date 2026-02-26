@@ -141,7 +141,7 @@ def _tier_gate(required: str, label: str) -> bool:
         if st.button(
             f"Upgrade to {required.upper()}",
             type="primary",
-            key=f"gate_upgrade_{required}",
+            key=f"gate_upgrade_{required}_{label.lower().replace(' ', '_')}",
         ):
             _upgrade_tier(required)
             st.rerun()
