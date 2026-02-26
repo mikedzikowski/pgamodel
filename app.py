@@ -1502,7 +1502,9 @@ with tab7:
         hist_w = 1.0 - type_w
 
         upcoming = [e for e in schedule if e.get("status") != "completed"]
-        upcoming_eids = tuple(e["event_id"] for e in upcoming if e.get("event_id"))
+        upcoming_eids = tuple(
+            int(e["event_id"]) for e in upcoming if e.get("event_id")
+        )
         upcoming_eids = upcoming_eids[:15]
 
         if not upcoming_eids:
@@ -1552,7 +1554,10 @@ with tab7:
             event_labels: list[tuple[int, str, str]] = []
             seen_eids: set[int] = set()
             for e in upcoming:
-                eid = e.get("event_id")
+                raw_eid = e.get("event_id")
+                if not raw_eid:
+                    continue
+                eid = int(raw_eid)
                 if eid in upcoming_eids and eid not in seen_eids:
                     name = (e.get("event_name") or "")[:20]
                     date = (e.get("start_date") or "")[:10]
@@ -1669,11 +1674,11 @@ with tab8:
             other_books = [b for b in all_book_keys if b not in priority]
             book_cols = [b for b in priority if b in all_book_keys] + sorted(other_books)
 
-            # Build dg_id → model win prob lookup
-            dg_win_lookup: dict[int, float] = {
-                p.dg_id: p.win_prob for p in predictions if sb_market == "win"
-            }
-            dg_rank_lookup: dict[int, int] = {p.dg_id: p.dg_rank for p in predictions}
+            # Build dg_id → model win prob lookup (rows already has dg_rank assigned)
+            dg_win_lookup: dict[int, float] = (
+                {r["dg_id"]: r["dg_signal"] for r in rows} if sb_market == "win" else {}
+            )
+            dg_rank_lookup: dict[int, int] = {r["dg_id"]: r["dg_rank"] for r in rows}
 
             def _fmt(prob: float | None) -> str:
                 if prob is None or prob <= 0:
