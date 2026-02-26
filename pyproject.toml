@@ -4,23 +4,35 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pga-oad"
-version = "0.1.0"
-description = "PGA One and Done season-long pick optimizer using DataGolf API"
+version = "1.0.0"
+description = "AI-powered PGA One-and-Done pick optimizer — subscription platform"
 requires-python = ">=3.11"
 dependencies = [
     "requests>=2.31",
     "pydantic>=2.5",
+    "pydantic[email]>=2.5",
     "python-dotenv>=1.0",
     "pulp>=2.8",
     "pandas>=2.1",
     "streamlit>=1.32",
     "plotly>=5.20",
+    # API & Auth
+    "fastapi>=0.109",
+    "uvicorn[standard]>=0.27",
+    "sqlalchemy>=2.0",
+    "PyJWT>=2.8",
+    "bcrypt>=4.0",
+    "python-multipart>=0.0.6",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=7.4",
     "pytest-mock>=3.12",
+    "httpx>=0.26",
+]
+payments = [
+    "stripe>=7.0",
 ]
 
 [tool.setuptools.packages.find]
