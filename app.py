@@ -20,11 +20,134 @@ from pga_oad.kalshi import KalshiClient
 from pga_oad.blend import SignalBlender, BlendedPlayer, _match_player
 from pga_oad.models import Prediction
 
+# Auth / DB / subscription imports
+from sqlalchemy.orm import sessionmaker
+from pga_oad.api.auth import hash_password, verify_password
+from pga_oad.db.engine import init_db, get_engine
+from pga_oad.db.crud import (
+    create_user, get_user_by_email, get_user_by_username,
+    get_subscription, update_subscription_tier,
+)
+from pga_oad.subscriptions import get_tier
+
+
 # ──────────────────────────────────────────────
 # Constants
 # ──────────────────────────────────────────────
 HISTORY_YEARS = [2025, 2024, 2023, 2022, 2021]
 CACHE_DIR = "data/raw"
+_TIER_ORDER = {"free": 0, "pro": 1, "elite": 2}
+
+
+# ──────────────────────────────────────────────
+# Database init (once per process)
+# ──────────────────────────────────────────────
+
+@st.cache_resource
+def _init_db():
+    init_db()
+
+_init_db()
+
+
+def _db():
+    """Return a new SQLAlchemy session. Caller must close it."""
+    return sessionmaker(bind=get_engine())()
+
+
+# ──────────────────────────────────────────────
+# Auth helpers
+# ──────────────────────────────────────────────
+
+def _do_login(email: str, password: str) -> str | None:
+    """Validate credentials and populate session_state. Returns error string or None."""
+    db = _db()
+    try:
+        user = get_user_by_email(db, email.strip().lower())
+        if not user or not verify_password(password, user.password_hash):
+            return "Invalid email or password."
+        sub = get_subscription(db, user.id)
+        tier = sub.tier if (sub and sub.is_active) else "free"
+        st.session_state.user_id   = user.id
+        st.session_state.username  = user.username
+        st.session_state.email     = user.email
+        st.session_state.tier_name = tier
+        return None
+    finally:
+        db.close()
+
+
+def _do_register(email: str, username: str, password: str) -> str | None:
+    """Create account and populate session_state. Returns error string or None."""
+    db = _db()
+    try:
+        if get_user_by_email(db, email.strip().lower()):
+            return "Email already registered."
+        if get_user_by_username(db, username.strip()):
+            return "Username already taken."
+        user = create_user(
+            db, email.strip().lower(), username.strip(), hash_password(password)
+        )
+        db.commit()
+        st.session_state.user_id   = user.id
+        st.session_state.username  = user.username
+        st.session_state.email     = user.email
+        st.session_state.tier_name = "free"
+        return None
+    except Exception as exc:
+        db.rollback()
+        return str(exc)
+    finally:
+        db.close()
+
+
+def _do_logout():
+    for k in ("user_id", "username", "email", "tier_name"):
+        st.session_state.pop(k, None)
+
+
+def _upgrade_tier(new_tier: str):
+    """Dev-mode tier upgrade: write to DB and refresh session_state."""
+    uid = st.session_state.get("user_id")
+    if not uid:
+        return
+    db = _db()
+    try:
+        update_subscription_tier(db, uid, new_tier)
+        db.commit()
+        st.session_state.tier_name = new_tier
+    finally:
+        db.close()
+
+
+def _tier_gate(required: str, label: str) -> bool:
+    """
+    Return True if the current user's tier meets or exceeds `required`.
+    Otherwise render a lock/upgrade prompt and return False.
+    """
+    current = st.session_state.get("tier_name", "free")
+    if _TIER_ORDER.get(current, 0) >= _TIER_ORDER.get(required, 0):
+        return True
+
+    fi = get_tier(required)
+    tier_emoji = {"pro": "⭐", "elite": "💎"}.get(required, "🔒")
+    st.markdown(f"## {tier_emoji} {required.upper()} Feature")
+    st.info(f"**{label}** requires a **{required.upper()}** subscription.")
+    st.markdown(
+        f"**{required.upper()} — ${fi.monthly_price:.2f}/mo** "
+        f"or ${fi.yearly_price:.2f}/yr"
+    )
+    if st.session_state.get("user_id"):
+        if st.button(
+            f"Upgrade to {required.upper()}",
+            type="primary",
+            key=f"gate_upgrade_{required}",
+        ):
+            _upgrade_tier(required)
+            st.rerun()
+    else:
+        st.warning("Sign in using the sidebar to upgrade your account.")
+    return False
 
 
 # ──────────────────────────────────────────────
@@ -481,6 +604,61 @@ with st.sidebar:
         st.cache_data.clear()
         st.rerun()
 
+    # ── Account ──────────────────────────────────────────────────────────
+    st.divider()
+    st.markdown("**Account**")
+
+    if not st.session_state.get("user_id"):
+        signin_tab, register_tab = st.tabs(["Sign In", "Register"])
+
+        with signin_tab:
+            with st.form("login_form"):
+                li_email    = st.text_input("Email", key="li_email")
+                li_password = st.text_input("Password", type="password", key="li_pass")
+                if st.form_submit_button("Sign In", use_container_width=True):
+                    err = _do_login(li_email, li_password)
+                    if err:
+                        st.error(err)
+                    else:
+                        st.rerun()
+
+        with register_tab:
+            with st.form("register_form"):
+                re_email    = st.text_input("Email", key="re_email")
+                re_username = st.text_input("Username", key="re_user")
+                re_password = st.text_input("Password", type="password", key="re_pass")
+                if st.form_submit_button("Create Account", use_container_width=True):
+                    err = _do_register(re_email, re_username, re_password)
+                    if err:
+                        st.error(err)
+                    else:
+                        st.rerun()
+    else:
+        _tier_name = st.session_state.tier_name
+        _tier_badge = {"free": "🆓 FREE", "pro": "⭐ PRO", "elite": "💎 ELITE"}.get(
+            _tier_name, _tier_name.upper()
+        )
+        st.markdown(f"**👤 {st.session_state.username}**")
+        st.caption(st.session_state.email)
+        st.markdown(f"Tier: **{_tier_badge}**")
+
+        if _tier_name != "elite":
+            st.divider()
+            st.caption("Dev mode — upgrade without Stripe")
+            _upgrades = [
+                t for t in ["pro", "elite"]
+                if _TIER_ORDER[t] > _TIER_ORDER.get(_tier_name, 0)
+            ]
+            _upgrade_to = st.selectbox("Select tier", ["—"] + _upgrades, key="sidebar_upgrade")
+            if st.button("Apply Upgrade", use_container_width=True) and _upgrade_to != "—":
+                _upgrade_tier(_upgrade_to)
+                st.rerun()
+
+        st.divider()
+        if st.button("Sign Out", use_container_width=True):
+            _do_logout()
+            st.rerun()
+
 
 # ──────────────────────────────────────────────
 # Build data rows (recomputed when sidebar changes)
@@ -622,139 +800,141 @@ with tab1:
 # TAB 2 — Course History
 # ══════════════════════════════════════════════
 with tab2:
-    st.subheader(f"Course History — Last 5 Years at {event_name}")
+    if _tier_gate("pro", "Course History"):
+        st.subheader(f"Course History — Last 5 Years at {event_name}")
 
-    show_top20_only = st.checkbox("Show only players with at least one top-20 finish here")
+        show_top20_only = st.checkbox("Show only players with at least one top-20 finish here")
 
-    hist_rows = []
-    for r in rows:
-        best = r["best_fin"]
-        has_top20 = any(
-            finish_sort_key(r["year_fins"].get(y, "—")) <= 20
-            for y in HISTORY_YEARS
-        )
-        if show_top20_only and not has_top20:
-            continue
-        if best == 9999:
-            continue  # Never played here
+        hist_rows = []
+        for r in rows:
+            best = r["best_fin"]
+            has_top20 = any(
+                finish_sort_key(r["year_fins"].get(y, "—")) <= 20
+                for y in HISTORY_YEARS
+            )
+            if show_top20_only and not has_top20:
+                continue
+            if best == 9999:
+                continue  # Never played here
 
-        record = {
-            "Player": r["display_name"],
-            "DG#": r["dg_rank"],
-            dg_signal_label: fmt_pct(r["dg_signal"]),
-            "Kal%": fmt_pct(r["kal_win"]) if r["kal_win"] is not None else "—",
-            "Best": str(best) if best < 9999 else "—",
-        }
-        for year in HISTORY_YEARS:
-            record[str(year)] = r["year_fins"].get(year, "—")
-        record["_best_sort"] = best
-        hist_rows.append(record)
+            record = {
+                "Player": r["display_name"],
+                "DG#": r["dg_rank"],
+                dg_signal_label: fmt_pct(r["dg_signal"]),
+                "Kal%": fmt_pct(r["kal_win"]) if r["kal_win"] is not None else "—",
+                "Best": str(best) if best < 9999 else "—",
+            }
+            for year in HISTORY_YEARS:
+                record[str(year)] = r["year_fins"].get(year, "—")
+            record["_best_sort"] = best
+            hist_rows.append(record)
 
-    hist_rows.sort(key=lambda x: x["_best_sort"])
-    hist_df = pd.DataFrame([{k: v for k, v in r.items() if k != "_best_sort"} for r in hist_rows])
+        hist_rows.sort(key=lambda x: x["_best_sort"])
+        hist_df = pd.DataFrame([{k: v for k, v in r.items() if k != "_best_sort"} for r in hist_rows])
 
-    if hist_df.empty:
-        st.info("No course history found for current field. Try unchecking the filter.")
-    else:
-        year_cols = [str(y) for y in HISTORY_YEARS]
-        styled_hist = hist_df.style.applymap(color_finish_cell, subset=year_cols)
-        st.dataframe(styled_hist, use_container_width=True, height=500, hide_index=True)
+        if hist_df.empty:
+            st.info("No course history found for current field. Try unchecking the filter.")
+        else:
+            year_cols = [str(y) for y in HISTORY_YEARS]
+            styled_hist = hist_df.style.applymap(color_finish_cell, subset=year_cols)
+            st.dataframe(styled_hist, use_container_width=True, height=500, hide_index=True)
 
-        st.caption(
-            "🥇 Gold = Win  🟢 Dark green = top-5  🟩 Light green = top-10  "
-            "🟡 Yellow = top-20  🟠 Salmon = CUT  🔴 Red = WD/DQ  — = not in field"
-        )
+            st.caption(
+                "🥇 Gold = Win  🟢 Dark green = top-5  🟩 Light green = top-10  "
+                "🟡 Yellow = top-20  🟠 Salmon = CUT  🔴 Red = WD/DQ  — = not in field"
+            )
 
 
 # ══════════════════════════════════════════════
 # TAB 3 — DG vs Kalshi Divergences
 # ══════════════════════════════════════════════
 with tab3:
-    st.subheader("DataGolf Model vs Kalshi Market — Divergences")
+    if _tier_gate("pro", "DataGolf vs Kalshi Divergences"):
+        st.subheader("DataGolf Model vs Kalshi Market — Divergences")
 
-    if not kalshi_ok:
-        st.warning("No Kalshi data available. Check that there are open golf markets.")
-    else:
-        edge_threshold = st.slider(
-            "Minimum |edge| to show",
-            min_value=0.0, max_value=3.0, value=0.5, step=0.1,
-            format="%.1f%%",
-        )
+        if not kalshi_ok:
+            st.warning("No Kalshi data available. Check that there are open golf markets.")
+        else:
+            edge_threshold = st.slider(
+                "Minimum |edge| to show",
+                min_value=0.0, max_value=3.0, value=0.5, step=0.1,
+                format="%.1f%%",
+            )
 
-        # Filter: liquid markets only (exclude thin), edge above threshold
-        liquid_rows = [
-            r for r in rows
-            if r["edge"] is not None and abs(r["edge"]) * 100 >= edge_threshold
-        ]
+            # Filter: liquid markets only (exclude thin), edge above threshold
+            liquid_rows = [
+                r for r in rows
+                if r["edge"] is not None and abs(r["edge"]) * 100 >= edge_threshold
+            ]
 
-        dg_higher = sorted([r for r in liquid_rows if r["edge"] < 0], key=lambda r: r["edge"])[:15]
-        kal_higher = sorted([r for r in liquid_rows if r["edge"] > 0], key=lambda r: r["edge"], reverse=True)[:15]
+            dg_higher = sorted([r for r in liquid_rows if r["edge"] < 0], key=lambda r: r["edge"])[:15]
+            kal_higher = sorted([r for r in liquid_rows if r["edge"] > 0], key=lambda r: r["edge"], reverse=True)[:15]
 
-        col_a, col_b = st.columns(2)
+            col_a, col_b = st.columns(2)
 
-        with col_a:
-            st.markdown("#### 📉 DataGolf more bullish than Kalshi")
-            st.caption("Model assigns higher win% than the market price")
-            if dg_higher:
-                fig = go.Figure(go.Bar(
-                    x=[r["edge"] * 100 for r in dg_higher],
-                    y=[r["display_name"] for r in dg_higher],
-                    orientation="h",
-                    marker_color="#74b9ff",
-                    text=[f"{r['dg_signal']*100:.1f}% DG vs {r['kal_win']*100:.1f}% Kal" for r in dg_higher],
-                    textposition="outside",
-                ))
-                fig.update_layout(
-                    xaxis_title="Edge (Kal - DG) %",
-                    margin=dict(l=0, r=60, t=10, b=30),
-                    height=max(300, len(dg_higher) * 28),
-                    xaxis=dict(ticksuffix="%"),
-                )
-                st.plotly_chart(fig, use_container_width=True)
+            with col_a:
+                st.markdown("#### 📉 DataGolf more bullish than Kalshi")
+                st.caption("Model assigns higher win% than the market price")
+                if dg_higher:
+                    fig = go.Figure(go.Bar(
+                        x=[r["edge"] * 100 for r in dg_higher],
+                        y=[r["display_name"] for r in dg_higher],
+                        orientation="h",
+                        marker_color="#74b9ff",
+                        text=[f"{r['dg_signal']*100:.1f}% DG vs {r['kal_win']*100:.1f}% Kal" for r in dg_higher],
+                        textposition="outside",
+                    ))
+                    fig.update_layout(
+                        xaxis_title="Edge (Kal - DG) %",
+                        margin=dict(l=0, r=60, t=10, b=30),
+                        height=max(300, len(dg_higher) * 28),
+                        xaxis=dict(ticksuffix="%"),
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
 
-                dg_higher_df = pd.DataFrame([{
-                    "Player": r["display_name"],
-                    "DG#": r["dg_rank"],
-                    dg_signal_label: fmt_pct(r["dg_signal"]),
-                    "Kal%": fmt_pct(r["kal_win"]),
-                    "Edge": fmt_edge(r["edge"]),
-                    "Course": " / ".join(str(r["year_fins"].get(y, "—")) for y in HISTORY_YEARS[:3]),
-                } for r in dg_higher])
-                st.dataframe(dg_higher_df, hide_index=True, use_container_width=True)
-            else:
-                st.info("No players meet the edge threshold.")
+                    dg_higher_df = pd.DataFrame([{
+                        "Player": r["display_name"],
+                        "DG#": r["dg_rank"],
+                        dg_signal_label: fmt_pct(r["dg_signal"]),
+                        "Kal%": fmt_pct(r["kal_win"]),
+                        "Edge": fmt_edge(r["edge"]),
+                        "Course": " / ".join(str(r["year_fins"].get(y, "—")) for y in HISTORY_YEARS[:3]),
+                    } for r in dg_higher])
+                    st.dataframe(dg_higher_df, hide_index=True, use_container_width=True)
+                else:
+                    st.info("No players meet the edge threshold.")
 
-        with col_b:
-            st.markdown("#### 📈 Kalshi more bullish than DataGolf")
-            st.caption("Market price implies higher win% than the model")
-            if kal_higher:
-                fig2 = go.Figure(go.Bar(
-                    x=[r["edge"] * 100 for r in kal_higher],
-                    y=[r["display_name"] for r in kal_higher],
-                    orientation="h",
-                    marker_color="#ff7675",
-                    text=[f"{r['dg_signal']*100:.1f}% DG vs {r['kal_win']*100:.1f}% Kal" for r in kal_higher],
-                    textposition="outside",
-                ))
-                fig2.update_layout(
-                    xaxis_title="Edge (Kal - DG) %",
-                    margin=dict(l=0, r=60, t=10, b=30),
-                    height=max(300, len(kal_higher) * 28),
-                    xaxis=dict(ticksuffix="%"),
-                )
-                st.plotly_chart(fig2, use_container_width=True)
+            with col_b:
+                st.markdown("#### 📈 Kalshi more bullish than DataGolf")
+                st.caption("Market price implies higher win% than the model")
+                if kal_higher:
+                    fig2 = go.Figure(go.Bar(
+                        x=[r["edge"] * 100 for r in kal_higher],
+                        y=[r["display_name"] for r in kal_higher],
+                        orientation="h",
+                        marker_color="#ff7675",
+                        text=[f"{r['dg_signal']*100:.1f}% DG vs {r['kal_win']*100:.1f}% Kal" for r in kal_higher],
+                        textposition="outside",
+                    ))
+                    fig2.update_layout(
+                        xaxis_title="Edge (Kal - DG) %",
+                        margin=dict(l=0, r=60, t=10, b=30),
+                        height=max(300, len(kal_higher) * 28),
+                        xaxis=dict(ticksuffix="%"),
+                    )
+                    st.plotly_chart(fig2, use_container_width=True)
 
-                kal_higher_df = pd.DataFrame([{
-                    "Player": r["display_name"],
-                    "DG#": r["dg_rank"],
-                    dg_signal_label: fmt_pct(r["dg_signal"]),
-                    "Kal%": fmt_pct(r["kal_win"]),
-                    "Edge": fmt_edge(r["edge"]),
-                    "Course": " / ".join(str(r["year_fins"].get(y, "—")) for y in HISTORY_YEARS[:3]),
-                } for r in kal_higher])
-                st.dataframe(kal_higher_df, hide_index=True, use_container_width=True)
-            else:
-                st.info("No players meet the edge threshold.")
+                    kal_higher_df = pd.DataFrame([{
+                        "Player": r["display_name"],
+                        "DG#": r["dg_rank"],
+                        dg_signal_label: fmt_pct(r["dg_signal"]),
+                        "Kal%": fmt_pct(r["kal_win"]),
+                        "Edge": fmt_edge(r["edge"]),
+                        "Course": " / ".join(str(r["year_fins"].get(y, "—")) for y in HISTORY_YEARS[:3]),
+                    } for r in kal_higher])
+                    st.dataframe(kal_higher_df, hide_index=True, use_container_width=True)
+                else:
+                    st.info("No players meet the edge threshold.")
 
 
 # ══════════════════════════════════════════════
@@ -891,109 +1071,111 @@ with tab4:
 # TAB 5 — Kalshi Markets
 # ══════════════════════════════════════════════
 with tab5:
-    st.subheader("Kalshi Prediction Markets — Raw Prices")
+    if _tier_gate("pro", "Kalshi Prediction Markets"):
+        st.subheader("Kalshi Prediction Markets — Raw Prices")
 
-    if not event_code:
-        st.warning("No open Kalshi golf markets detected.")
-    else:
-        st.caption(f"Event code: **{event_code}**  |  Prices in cents (0–100).  "
-                   "Mid = (Bid + Ask) / 2.  No = 100 − Yes.")
-
-        MARKET_LABELS = {
-            "win":      "🏆 Tournament Winner",
-            "top5":     "Top 5 Finish",
-            "top10":    "Top 10 Finish",
-            "top20":    "Top 20 Finish",
-            "make_cut": "Make the Cut",
-        }
-
-        selected_market = st.selectbox(
-            "Market type",
-            options=list(MARKET_LABELS.keys()),
-            format_func=lambda k: MARKET_LABELS[k],
-        )
-
-        with st.spinner(f"Loading {MARKET_LABELS[selected_market]} markets..."):
-            raw_data = load_kalshi_raw(event_code, selected_market)
-
-        if not raw_data:
-            st.info(f"No {MARKET_LABELS[selected_market]} markets found for event {event_code}.")
+        if not event_code:
+            st.warning("No open Kalshi golf markets detected.")
         else:
-            # Build display rows
-            mkt_records = []
-            for m in raw_data:
-                yes_bid   = m["yes_bid"]    # cents
-                yes_ask   = m["yes_ask"]    # cents
-                last      = m["last_price"] # cents
-                mid       = round((yes_bid + yes_ask) / 2, 1) if yes_bid and yes_ask else None
-                no_bid    = (100 - yes_ask) if yes_ask else None
-                no_ask    = (100 - yes_bid) if yes_bid else None
-                implied   = m["raw_prob"]
-                thin      = m["thin"]
+            st.caption(f"Event code: **{event_code}**  |  Prices in cents (0–100).  "
+                       "Mid = (Bid + Ask) / 2.  No = 100 − Yes.")
 
-                mkt_records.append({
-                    "Player":       m["player_name"],
-                    "Yes Bid":      yes_bid  if yes_bid  else "—",
-                    "Yes Ask":      yes_ask  if yes_ask  else "—",
-                    "Mid":          mid      if mid is not None else "—",
-                    "No Bid":       no_bid   if no_bid is not None else "—",
-                    "No Ask":       no_ask   if no_ask is not None else "—",
-                    "Last":         last     if last    else "—",
-                    "Implied%":     f"{implied*100:.1f}%" if implied else "—",
-                    "Liquid":       "✅" if not thin else "⚠️ thin",
-                    "_implied_raw": implied,
-                    "_thin":        thin,
-                })
+            MARKET_LABELS = {
+                "win":      "🏆 Tournament Winner",
+                "top5":     "Top 5 Finish",
+                "top10":    "Top 10 Finish",
+                "top20":    "Top 20 Finish",
+                "make_cut": "Make the Cut",
+            }
 
-            # Sort by implied prob descending (liquid first, then thin)
-            mkt_records.sort(key=lambda r: (r["_thin"], -r["_implied_raw"]))
-
-            mkt_df = pd.DataFrame([{k: v for k, v in r.items() if not k.startswith("_")} for r in mkt_records])
-
-            def color_liquid(val):
-                if val == "✅":
-                    return "background-color: #e8f5e9; color: #2e7d32"
-                if "thin" in str(val):
-                    return "background-color: #fff3e0; color: #e65100"
-                return ""
-
-            def color_bid_ask(val):
-                if val == "—":
-                    return "color: #aaa"
-                return ""
-
-            styled_mkt = (
-                mkt_df.style
-                .applymap(color_liquid, subset=["Liquid"])
-                .applymap(color_bid_ask, subset=["Yes Bid", "Yes Ask", "No Bid", "No Ask", "Last"])
+            selected_market = st.selectbox(
+                "Market type",
+                options=list(MARKET_LABELS.keys()),
+                format_func=lambda k: MARKET_LABELS[k],
             )
 
-            liquid_count = sum(1 for r in mkt_records if not r["_thin"])
-            thin_count   = sum(1 for r in mkt_records if r["_thin"])
+            with st.spinner(f"Loading {MARKET_LABELS[selected_market]} markets..."):
+                raw_data = load_kalshi_raw(event_code, selected_market)
 
-            col_l, col_t, col_i = st.columns(3)
-            col_l.metric("Liquid markets", liquid_count)
-            col_t.metric("Thin markets",   thin_count)
-            col_i.metric("Total players",  len(mkt_records))
+            if not raw_data:
+                st.info(f"No {MARKET_LABELS[selected_market]} markets found for event {event_code}.")
+            else:
+                # Build display rows
+                mkt_records = []
+                for m in raw_data:
+                    yes_bid   = m["yes_bid"]    # cents
+                    yes_ask   = m["yes_ask"]    # cents
+                    last      = m["last_price"] # cents
+                    mid       = round((yes_bid + yes_ask) / 2, 1) if yes_bid and yes_ask else None
+                    no_bid    = (100 - yes_ask) if yes_ask else None
+                    no_ask    = (100 - yes_bid) if yes_bid else None
+                    implied   = m["raw_prob"]
+                    thin      = m["thin"]
 
-            st.dataframe(styled_mkt, use_container_width=True, height=550, hide_index=True)
+                    mkt_records.append({
+                        "Player":       m["player_name"],
+                        "Yes Bid":      yes_bid  if yes_bid  else "—",
+                        "Yes Ask":      yes_ask  if yes_ask  else "—",
+                        "Mid":          mid      if mid is not None else "—",
+                        "No Bid":       no_bid   if no_bid is not None else "—",
+                        "No Ask":       no_ask   if no_ask is not None else "—",
+                        "Last":         last     if last    else "—",
+                        "Implied%":     f"{implied*100:.1f}%" if implied else "—",
+                        "Liquid":       "✅" if not thin else "⚠️ thin",
+                        "_implied_raw": implied,
+                        "_thin":        thin,
+                    })
 
-            st.caption(
-                "**Yes Bid/Ask** = prices to buy/sell a YES contract (cents).  "
-                "**No Bid/Ask** = 100 − Yes Ask / 100 − Yes Bid.  "
-                "**Mid** = fair-value estimate.  "
-                "**⚠️ thin** = no active quotes (floor-price artifact, excluded from blended model)."
-            )
+                # Sort by implied prob descending (liquid first, then thin)
+                mkt_records.sort(key=lambda r: (r["_thin"], -r["_implied_raw"]))
+
+                mkt_df = pd.DataFrame([{k: v for k, v in r.items() if not k.startswith("_")} for r in mkt_records])
+
+                def color_liquid(val):
+                    if val == "✅":
+                        return "background-color: #e8f5e9; color: #2e7d32"
+                    if "thin" in str(val):
+                        return "background-color: #fff3e0; color: #e65100"
+                    return ""
+
+                def color_bid_ask(val):
+                    if val == "—":
+                        return "color: #aaa"
+                    return ""
+
+                styled_mkt = (
+                    mkt_df.style
+                    .applymap(color_liquid, subset=["Liquid"])
+                    .applymap(color_bid_ask, subset=["Yes Bid", "Yes Ask", "No Bid", "No Ask", "Last"])
+                )
+
+                liquid_count = sum(1 for r in mkt_records if not r["_thin"])
+                thin_count   = sum(1 for r in mkt_records if r["_thin"])
+
+                col_l, col_t, col_i = st.columns(3)
+                col_l.metric("Liquid markets", liquid_count)
+                col_t.metric("Thin markets",   thin_count)
+                col_i.metric("Total players",  len(mkt_records))
+
+                st.dataframe(styled_mkt, use_container_width=True, height=550, hide_index=True)
+
+                st.caption(
+                    "**Yes Bid/Ask** = prices to buy/sell a YES contract (cents).  "
+                    "**No Bid/Ask** = 100 − Yes Ask / 100 − Yes Bid.  "
+                    "**Mid** = fair-value estimate.  "
+                    "**⚠️ thin** = no active quotes (floor-price artifact, excluded from blended model)."
+                )
 
 
 # ══════════════════════════════════════════════
 # TAB 6 — Proprietary Model
 # ══════════════════════════════════════════════
 with tab6:
-    st.subheader("Proprietary Win Prediction Model")
+    if _tier_gate("elite", "Proprietary Model"):
+        st.subheader("Proprietary Win Prediction Model")
 
-    with st.expander("📖 How this model works", expanded=False):
-        st.markdown("""
+        with st.expander("📖 How this model works", expanded=False):
+            st.markdown("""
 **Overview**
 
 A proprietary multi-signal ensemble that blends five independent data sources into a
@@ -1073,153 +1255,153 @@ proportionally to always sum to 100%.
 - **Red / negative** = our model ranks the player *lower* (more bearish than DG)
         """)
 
-    st.caption(
-        "Signals: **DataGolf (40%)** + **DraftKings odds (30%)** + "
-        "**Kalshi (15%)** + **Recent Form (10%)** + **Course History (5%)**. "
-        "Weights adapt when a signal is unavailable."
-    )
+        st.caption(
+            "Signals: **DataGolf (40%)** + **DraftKings odds (30%)** + "
+            "**Kalshi (15%)** + **Recent Form (10%)** + **Course History (5%)**. "
+            "Weights adapt when a signal is unavailable."
+        )
 
-    if not event_id:
-        st.error("Cannot determine event ID from schedule. Cannot run proprietary model.")
-    else:
-        with st.spinner("Running proprietary model..."):
-            try:
-                prop_players = load_proprietary_model(
-                    event_id=int(event_id),
-                    event_code=event_code or "",
-                )
-            except Exception as _e:
-                st.error(f"Proprietary model error: {_e}")
-                prop_players = []
-
-        if not prop_players:
-            st.warning("No proprietary model output available.")
+        if not event_id:
+            st.error("Cannot determine event ID from schedule. Cannot run proprietary model.")
         else:
-            # ── Summary metrics ──────────────────────────────────────────
-            market_cov  = sum(1 for p in prop_players if p.market_consensus_prob is not None)
-            kalshi_cov  = sum(1 for p in prop_players if p.kalshi_win_prob is not None)
-            form_cov    = sum(1 for p in prop_players if getattr(p, "recent_form_score", None) is not None)
-            history_cov = sum(1 for p in prop_players if p.recency_course_score is not None)
+            with st.spinner("Running proprietary model..."):
+                try:
+                    prop_players = load_proprietary_model(
+                        event_id=int(event_id),
+                        event_code=event_code or "",
+                    )
+                except Exception as _e:
+                    st.error(f"Proprietary model error: {_e}")
+                    prop_players = []
 
-            pm1, pm2, pm3, pm4, pm5 = st.columns(5)
-            pm1.metric("Field size", len(prop_players))
-            pm2.metric("Sportsbook coverage", f"{market_cov}/{len(prop_players)}")
-            pm3.metric("Kalshi coverage", f"{kalshi_cov}/{len(prop_players)}")
-            pm4.metric("Recent form", f"{form_cov}/{len(prop_players)}")
-            pm5.metric("Course history", f"{history_cov}/{len(prop_players)}")
-
-            st.divider()
-
-            # ── Full field table ─────────────────────────────────────────
-            st.markdown("#### Full Field Rankings")
-
-            def _fmt_delta(v: int) -> str:
-                if v == 0:
-                    return "—"
-                sign = "+" if v > 0 else ""
-                return f"{sign}{v}"
-
-            def _delta_style(delta: int) -> str:
-                if delta >= 5:  return "background:#2ecc71;color:white;font-weight:bold"
-                if delta >= 2:  return "background:#a8e6cf;color:black"
-                if delta <= -5: return "background:#e74c3c;color:white;font-weight:bold"
-                if delta <= -2: return "background:#fab1a0;color:black"
-                return ""
-
-            headers = ["Prop#", "Δ vs DG", "Player ⓘ", "Used", "Prop Win%",
-                       "DG Win%", "DK Odds", "Market%", "Kalshi%", "Form", "Crs Score", "Weights"]
-            th = "".join(f"<th>{h}</th>" for h in headers)
-
-            rows_html = []
-            for p in prop_players:
-                is_used = p.dg_id in used_player_ids
-                w = p.weights_used
-                wt_str = (f"DG{w.get('dg',0)*100:.0f}/"
-                          f"Mkt{w.get('market',0)*100:.0f}/"
-                          f"Kal{w.get('kalshi',0)*100:.0f}/"
-                          f"Frm{w.get('form',0)*100:.0f}/"
-                          f"Hist{w.get('history',0)*100:.0f}")
-                tip = build_prop_tooltip(p).replace('"', '&quot;')
-                delta_s = _delta_style(p.rank_delta)
-                frm = getattr(p, "recent_form_score", None)
-                rows_html.append(
-                    f'<tr{"  class=\"used\"" if is_used else ""}>'
-                    f"<td>{p.proprietary_rank}</td>"
-                    f'<td style="{delta_s}">{_fmt_delta(p.rank_delta)}</td>'
-                    f'<td class="tip" data-tip="{tip}">{dg_name_to_display(p.player_name)}</td>'
-                    f'<td>{"✓" if is_used else ""}</td>'
-                    f"<td>{fmt_pct(p.proprietary_win_prob)}</td>"
-                    f"<td>{fmt_pct(p.dg_win_prob_history)}</td>"
-                    f"<td>{fmt_american(getattr(p, 'dk_raw_prob', None))}</td>"
-                    f'<td>{"—" if p.market_consensus_prob is None else fmt_pct(p.market_consensus_prob)}</td>'
-                    f'<td>{"—" if p.kalshi_win_prob is None else fmt_pct(p.kalshi_win_prob)}</td>'
-                    f'<td>{"—" if frm is None else f"{frm:.2f}"}</td>'
-                    f'<td>{"—" if p.recency_course_score is None else f"{p.recency_course_score:.2f}"}</td>'
-                    f'<td style="color:#888;font-size:0.75rem">{wt_str}</td>'
-                    f"</tr>"
-                )
-
-            prop_html = (
-                '<div style="overflow-y:auto;max-height:600px;overflow-x:auto">'
-                f'<table class="prop-table"><thead><tr>{th}</tr></thead>'
-                f'<tbody>{"".join(rows_html)}</tbody></table></div>'
-            )
-            st.markdown(prop_html, unsafe_allow_html=True)
-            st.caption(
-                "**Player ⓘ** = hover for signal breakdown  |  "
-                "**Prop#** = our rank  |  "
-                "**Δ vs DG** = DG rank minus our rank "
-                "(green = we rank higher / more bullish, red = we rank lower / more bearish)  |  "
-                "**Form** = 0–1 recent form score (last 5 events)  |  "
-                "**Crs Score** = 0–1 recency-weighted course history  |  "
-                "**Weights** = adaptive signal weights applied for this player"
-            )
-
-            st.divider()
-
-            # ── Key Divergences ──────────────────────────────────────────
-            st.markdown("#### Key Divergences: Where We Differ Most from DataGolf")
-            st.caption("Top 10 players where our proprietary rank most disagrees with DataGolf.")
-
-            with_delta = [p for p in prop_players if abs(p.rank_delta) >= 2]
-            top_div = sorted(with_delta, key=lambda p: abs(p.rank_delta), reverse=True)[:10]
-
-            if not top_div:
-                st.info("No significant divergences (all players within 1 rank of DataGolf).")
+            if not prop_players:
+                st.warning("No proprietary model output available.")
             else:
-                div_records = []
-                for p in top_div:
-                    direction = "We rank HIGHER" if p.rank_delta > 0 else "We rank LOWER"
-                    hist_parts = []
-                    for yr in [2025, 2024, 2023]:
-                        fin = p.finish_history.get(yr, "—")
-                        hist_parts.append(f"{yr}: {fin}")
-
-                    _frm = getattr(p, "recent_form_score", None)
-                    div_records.append({
-                        "Player":    dg_name_to_display(p.player_name),
-                        "DG#":       p.dg_rank,
-                        "Prop#":     p.proprietary_rank,
-                        "Δ":         _fmt_delta(p.rank_delta),
-                        "Direction": direction,
-                        "DG Win%":   fmt_pct(p.dg_win_prob_history),
-                        "Prop Win%": fmt_pct(p.proprietary_win_prob),
-                        "DK Odds":   fmt_american(getattr(p, "dk_raw_prob", None)),
-                        "Market%":   fmt_pct(p.market_consensus_prob) if p.market_consensus_prob is not None else "—",
-                        "Kalshi%":   fmt_pct(p.kalshi_win_prob) if p.kalshi_win_prob is not None else "—",
-                        "Form":      f"{_frm:.2f}" if _frm is not None else "—",
-                        "Crs Score": f"{p.recency_course_score:.2f}" if p.recency_course_score is not None else "—",
-                        "History":   "  |  ".join(hist_parts),
-                    })
-
-                div_df = pd.DataFrame(div_records)
-
-                def _color_direction(val: str) -> str:
-                    if "HIGHER" in str(val):
-                        return "background-color: #2ecc71; color: white; font-weight: bold"
-                    if "LOWER" in str(val):
-                        return "background-color: #e74c3c; color: white; font-weight: bold"
+                # ── Summary metrics ──────────────────────────────────────────
+                market_cov  = sum(1 for p in prop_players if p.market_consensus_prob is not None)
+                kalshi_cov  = sum(1 for p in prop_players if p.kalshi_win_prob is not None)
+                form_cov    = sum(1 for p in prop_players if getattr(p, "recent_form_score", None) is not None)
+                history_cov = sum(1 for p in prop_players if p.recency_course_score is not None)
+    
+                pm1, pm2, pm3, pm4, pm5 = st.columns(5)
+                pm1.metric("Field size", len(prop_players))
+                pm2.metric("Sportsbook coverage", f"{market_cov}/{len(prop_players)}")
+                pm3.metric("Kalshi coverage", f"{kalshi_cov}/{len(prop_players)}")
+                pm4.metric("Recent form", f"{form_cov}/{len(prop_players)}")
+                pm5.metric("Course history", f"{history_cov}/{len(prop_players)}")
+    
+                st.divider()
+    
+                # ── Full field table ─────────────────────────────────────────
+                st.markdown("#### Full Field Rankings")
+    
+                def _fmt_delta(v: int) -> str:
+                    if v == 0:
+                        return "—"
+                    sign = "+" if v > 0 else ""
+                    return f"{sign}{v}"
+    
+                def _delta_style(delta: int) -> str:
+                    if delta >= 5:  return "background:#2ecc71;color:white;font-weight:bold"
+                    if delta >= 2:  return "background:#a8e6cf;color:black"
+                    if delta <= -5: return "background:#e74c3c;color:white;font-weight:bold"
+                    if delta <= -2: return "background:#fab1a0;color:black"
                     return ""
-
-                styled_div = div_df.style.applymap(_color_direction, subset=["Direction"])
-                st.dataframe(styled_div, use_container_width=True, hide_index=True)
+    
+                headers = ["Prop#", "Δ vs DG", "Player ⓘ", "Used", "Prop Win%",
+                           "DG Win%", "DK Odds", "Market%", "Kalshi%", "Form", "Crs Score", "Weights"]
+                th = "".join(f"<th>{h}</th>" for h in headers)
+    
+                rows_html = []
+                for p in prop_players:
+                    is_used = p.dg_id in used_player_ids
+                    w = p.weights_used
+                    wt_str = (f"DG{w.get('dg',0)*100:.0f}/"
+                              f"Mkt{w.get('market',0)*100:.0f}/"
+                              f"Kal{w.get('kalshi',0)*100:.0f}/"
+                              f"Frm{w.get('form',0)*100:.0f}/"
+                              f"Hist{w.get('history',0)*100:.0f}")
+                    tip = build_prop_tooltip(p).replace('"', '&quot;')
+                    delta_s = _delta_style(p.rank_delta)
+                    frm = getattr(p, "recent_form_score", None)
+                    rows_html.append(
+                        f'<tr{"  class=\"used\"" if is_used else ""}>'
+                        f"<td>{p.proprietary_rank}</td>"
+                        f'<td style="{delta_s}">{_fmt_delta(p.rank_delta)}</td>'
+                        f'<td class="tip" data-tip="{tip}">{dg_name_to_display(p.player_name)}</td>'
+                        f'<td>{"✓" if is_used else ""}</td>'
+                        f"<td>{fmt_pct(p.proprietary_win_prob)}</td>"
+                        f"<td>{fmt_pct(p.dg_win_prob_history)}</td>"
+                        f"<td>{fmt_american(getattr(p, 'dk_raw_prob', None))}</td>"
+                        f'<td>{"—" if p.market_consensus_prob is None else fmt_pct(p.market_consensus_prob)}</td>'
+                        f'<td>{"—" if p.kalshi_win_prob is None else fmt_pct(p.kalshi_win_prob)}</td>'
+                        f'<td>{"—" if frm is None else f"{frm:.2f}"}</td>'
+                        f'<td>{"—" if p.recency_course_score is None else f"{p.recency_course_score:.2f}"}</td>'
+                        f'<td style="color:#888;font-size:0.75rem">{wt_str}</td>'
+                        f"</tr>"
+                    )
+    
+                prop_html = (
+                    '<div style="overflow-y:auto;max-height:600px;overflow-x:auto">'
+                    f'<table class="prop-table"><thead><tr>{th}</tr></thead>'
+                    f'<tbody>{"".join(rows_html)}</tbody></table></div>'
+                )
+                st.markdown(prop_html, unsafe_allow_html=True)
+                st.caption(
+                    "**Player ⓘ** = hover for signal breakdown  |  "
+                    "**Prop#** = our rank  |  "
+                    "**Δ vs DG** = DG rank minus our rank "
+                    "(green = we rank higher / more bullish, red = we rank lower / more bearish)  |  "
+                    "**Form** = 0–1 recent form score (last 5 events)  |  "
+                    "**Crs Score** = 0–1 recency-weighted course history  |  "
+                    "**Weights** = adaptive signal weights applied for this player"
+                )
+    
+                st.divider()
+    
+                # ── Key Divergences ──────────────────────────────────────────
+                st.markdown("#### Key Divergences: Where We Differ Most from DataGolf")
+                st.caption("Top 10 players where our proprietary rank most disagrees with DataGolf.")
+    
+                with_delta = [p for p in prop_players if abs(p.rank_delta) >= 2]
+                top_div = sorted(with_delta, key=lambda p: abs(p.rank_delta), reverse=True)[:10]
+    
+                if not top_div:
+                    st.info("No significant divergences (all players within 1 rank of DataGolf).")
+                else:
+                    div_records = []
+                    for p in top_div:
+                        direction = "We rank HIGHER" if p.rank_delta > 0 else "We rank LOWER"
+                        hist_parts = []
+                        for yr in [2025, 2024, 2023]:
+                            fin = p.finish_history.get(yr, "—")
+                            hist_parts.append(f"{yr}: {fin}")
+    
+                        _frm = getattr(p, "recent_form_score", None)
+                        div_records.append({
+                            "Player":    dg_name_to_display(p.player_name),
+                            "DG#":       p.dg_rank,
+                            "Prop#":     p.proprietary_rank,
+                            "Δ":         _fmt_delta(p.rank_delta),
+                            "Direction": direction,
+                            "DG Win%":   fmt_pct(p.dg_win_prob_history),
+                            "Prop Win%": fmt_pct(p.proprietary_win_prob),
+                            "DK Odds":   fmt_american(getattr(p, "dk_raw_prob", None)),
+                            "Market%":   fmt_pct(p.market_consensus_prob) if p.market_consensus_prob is not None else "—",
+                            "Kalshi%":   fmt_pct(p.kalshi_win_prob) if p.kalshi_win_prob is not None else "—",
+                            "Form":      f"{_frm:.2f}" if _frm is not None else "—",
+                            "Crs Score": f"{p.recency_course_score:.2f}" if p.recency_course_score is not None else "—",
+                            "History":   "  |  ".join(hist_parts),
+                        })
+    
+                    div_df = pd.DataFrame(div_records)
+    
+                    def _color_direction(val: str) -> str:
+                        if "HIGHER" in str(val):
+                            return "background-color: #2ecc71; color: white; font-weight: bold"
+                        if "LOWER" in str(val):
+                            return "background-color: #e74c3c; color: white; font-weight: bold"
+                        return ""
+    
+                    styled_div = div_df.style.applymap(_color_direction, subset=["Direction"])
+                    st.dataframe(styled_div, use_container_width=True, hide_index=True)
